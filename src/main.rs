@@ -46,7 +46,7 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let gate = Gate::new()?;
+    let gate = Gate::new(gate::home_reviewers()?)?;
     let not_you = |name: &str| if name == YOU { Err("only the GUI acts as you".to_string()) } else { Ok(()) };
     match cli {
         Cli::Open { slug, prompt } => println!("{}", gate.open(&slug, &prompt)?.display()),
@@ -57,7 +57,11 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Cli::Show { slug } => show(&gate, &slug)?,
-        Cli::Reviewers => println!("{}", gate.rules()?.join("\n")),
+        Cli::Reviewers => {
+            for (name, path) in gate.rules()? {
+                println!("{name}\t{}", path.display());
+            }
+        }
         Cli::Wait { slug, role } => {
             let (tx, changes) = std::sync::mpsc::channel();
             let mut watcher = notify::recommended_watcher(move |_| {

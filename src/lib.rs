@@ -1,6 +1,7 @@
 use clap::ValueEnum;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -317,6 +318,7 @@ struct ReviewRow {
 pub struct Gate {
     root: PathBuf,
     store: PathBuf,
+    reviewers: PathBuf,
     db: Connection,
 }
 
@@ -336,8 +338,12 @@ fn sql(e: rusqlite::Error) -> String {
     e.to_string()
 }
 
+pub fn home_reviewers() -> Result<PathBuf> {
+    Ok(PathBuf::from(std::env::var("HOME").map_err(|_| "HOME is unset")?).join(".gate/reviewers"))
+}
+
 impl Gate {
-    pub fn new() -> Result<Gate> {
+    pub fn new(reviewers: PathBuf) -> Result<Gate> {
         let common = PathBuf::from(git(Path::new("."), &["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
         let root = common.parent().ok_or("bare repositories are unsupported")?.to_path_buf();
         let store = common.join("gate");
@@ -349,7 +355,7 @@ impl Gate {
         if !has_state {
             db.execute("ALTER TABLE prs ADD COLUMN state TEXT NOT NULL DEFAULT 'open'", []).map_err(sql)?;
         }
-        Ok(Gate { root, store, db })
+        Ok(Gate { root, store, reviewers, db })
     }
 
     fn worktree(&self, slug: &str) -> PathBuf {
@@ -374,22 +380,23 @@ impl Gate {
         git(&self.root, &["rev-parse", "--short=12", &format!("gate/{slug}")])
     }
 
-    pub fn rules(&self) -> Result<Vec<String>> {
-        let home = std::env::var("HOME").map_err(|_| "HOME is unset")?;
-        let dirs = [PathBuf::from(home).join(".claude/skills"), self.root.join(".claude/skills")];
-        let mut rules: Vec<String> = dirs
+    pub fn rules(&self) -> Result<BTreeMap<String, PathBuf>> {
+        let dirs = [self.reviewers.clone(), self.root.join(".gate/reviewers")];
+        let rules: BTreeMap<String, PathBuf> = dirs
             .iter()
             .flat_map(fs::read_dir)
             .flatten()
             .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("arch-"))
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "md"))
+            .filter_map(|p| Some((p.file_stem()?.to_string_lossy().into_owned(), p)))
             .collect();
-        if rules.is_empty() {
-            return Err(format!("no arch-* reviewers in {} or {}", dirs[0].display(), dirs[1].display()));
+        if let Some(path) = [YOU, IMPLEMENTER, ARBITER].iter().find_map(|role| rules.get(*role)) {
+            return Err(format!("{} is named after a role; rename it", path.display()));
         }
-        rules.sort();
-        rules.dedup();
+        if rules.is_empty() {
+            return Err(format!("no reviewers in {} or {}", dirs[0].display(), dirs[1].display()));
+        }
         Ok(rules)
     }
 
@@ -489,7 +496,7 @@ impl Gate {
         };
         let awaiting = self
             .rules()?
-            .into_iter()
+            .into_keys()
             .filter(|rule| !unsettled(rule) && latest(rule) != Some(Verdict::Approve))
             .collect();
         let mut status = Status {
@@ -612,7 +619,7 @@ impl Gate {
         let threads = self.threads(slug)?;
         let reviewers = self
             .rules()?
-            .into_iter()
+            .into_keys()
             .chain(std::iter::once(YOU.to_string()))
             .map(|reviewer| {
                 let verdict = reviews.iter().rev().find(|r| r.sha == head && r.reviewer == reviewer).map(|r| r.verdict);
@@ -682,7 +689,7 @@ impl Gate {
     }
 
     pub fn review(&self, slug: &str, reviewer: &str, verdict: Verdict, comments: Vec<Comment>) -> Result<()> {
-        if !self.rules()?.iter().any(|r| r == reviewer) {
+        if !self.rules()?.contains_key(reviewer) {
             return Err(format!("no reviewer {reviewer}"));
         }
         if verdict == Verdict::Comment {
@@ -732,7 +739,7 @@ impl Gate {
 
     pub fn reply(&self, thread: i64, author: &str, body: &str) -> Result<()> {
         let (_, t) = self.thread(thread)?;
-        if author != YOU && author != IMPLEMENTER && !self.rules()?.iter().any(|r| r == author) {
+        if author != YOU && author != IMPLEMENTER && !self.rules()?.contains_key(author) {
             return Err(format!("unknown author {author}"));
         }
         if t.resolved_by.is_some() {

@@ -1518,7 +1518,7 @@ fn view<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
 }
 
 fn main() {
-    let gate = Gate::new().unwrap_or_else(|e| {
+    let gate = gate::home_reviewers().and_then(Gate::new).unwrap_or_else(|e| {
         eprintln!("gate-gui: {e}");
         process::exit(1)
     });
@@ -1577,12 +1577,12 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("gate-gui-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let repo = tmp.join("repo");
-        std::fs::create_dir_all(tmp.join("home/.claude/skills/arch-test")).unwrap();
+        std::fs::create_dir_all(tmp.join("reviewers")).unwrap();
+        std::fs::write(tmp.join("reviewers/arch-test.md"), "").unwrap();
         std::fs::create_dir_all(&repo).unwrap();
-        unsafe { std::env::set_var("HOME", tmp.join("home")) };
         sh(&repo, "git init -q && git config user.email t@t && git config user.name t && echo a > f && git add . && git commit -qm init");
         std::env::set_current_dir(&repo).unwrap();
-        let gate = Gate::new().unwrap();
+        let gate = Gate::new(tmp.join("reviewers")).unwrap();
         let tree = gate.open("pr", "task").unwrap();
         sh(&tree, "git config user.email t@t && git config user.name t && echo b > f && git commit -qam b");
         gate.review("pr", "arch-test", Verdict::Approve, vec![]).unwrap();
@@ -1591,7 +1591,7 @@ mod tests {
         let (jobs, inbox) = channel();
         let (outbox, updates) = channel();
         let notify = jobs.clone();
-        let worker = Gate::new().unwrap();
+        let worker = Gate::new(tmp.join("reviewers")).unwrap();
         thread::spawn(move || work(worker, notify, inbox, outbox));
         let mut state = State::new(jobs, updates);
         state.selected = Some("pr".into());

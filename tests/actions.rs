@@ -21,12 +21,12 @@ fn review_threads_merge_close() {
     let tmp = std::env::temp_dir().join(format!("gate-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let repo = tmp.join("repo");
-    std::fs::create_dir_all(tmp.join("home/.claude/skills/arch-test")).unwrap();
+    std::fs::create_dir_all(tmp.join("reviewers")).unwrap();
+    std::fs::write(tmp.join("reviewers/arch-test.md"), "").unwrap();
     std::fs::create_dir_all(&repo).unwrap();
-    unsafe { std::env::set_var("HOME", tmp.join("home")) };
     sh(&repo, "git init -q && git config user.email t@t && git config user.name t && echo a > f && git add . && git commit -qm init");
     std::env::set_current_dir(&repo).unwrap();
-    let gate = Gate::new().unwrap();
+    let gate = Gate::new(tmp.join("reviewers")).unwrap();
 
     for slug in ["keep", "drop"] {
         let tree = gate.open(slug, "add b").unwrap();
@@ -90,12 +90,12 @@ fn conflicts_need_a_sync() {
     let tmp = std::env::temp_dir().join(format!("gate-conflict-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let repo = tmp.join("repo");
-    std::fs::create_dir_all(tmp.join("home/.claude/skills/arch-test")).unwrap();
+    std::fs::create_dir_all(tmp.join("reviewers")).unwrap();
+    std::fs::write(tmp.join("reviewers/arch-test.md"), "").unwrap();
     std::fs::create_dir_all(&repo).unwrap();
-    unsafe { std::env::set_var("HOME", tmp.join("home")) };
     sh(&repo, "git init -q -b trunk && git config user.email t@t && git config user.name t && echo a > f && git add . && git commit -qm init");
     std::env::set_current_dir(&repo).unwrap();
-    let gate = Gate::new().unwrap();
+    let gate = Gate::new(tmp.join("reviewers")).unwrap();
     for slug in ["one", "two"] {
         let tree = gate.open(slug, "edit f").unwrap();
         sh(&tree, &format!("git config user.email t@t && git config user.name t && echo {slug} > f && git commit -qam {slug}"));
@@ -122,12 +122,12 @@ fn threads_outlive_commits() {
     let tmp = std::env::temp_dir().join(format!("gate-settle-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let repo = tmp.join("repo");
-    std::fs::create_dir_all(tmp.join("home/.claude/skills/arch-test")).unwrap();
+    std::fs::create_dir_all(tmp.join("reviewers")).unwrap();
+    std::fs::write(tmp.join("reviewers/arch-test.md"), "").unwrap();
     std::fs::create_dir_all(&repo).unwrap();
-    unsafe { std::env::set_var("HOME", tmp.join("home")) };
     sh(&repo, "git init -q && git config user.email t@t && git config user.name t && echo a > f && git add . && git commit -qm init");
     std::env::set_current_dir(&repo).unwrap();
-    let gate = Gate::new().unwrap();
+    let gate = Gate::new(tmp.join("reviewers")).unwrap();
     let tree = gate.open("pr", "task").unwrap();
     sh(&tree, "git config user.email t@t && git config user.name t && echo b > f && git commit -qam b");
     gate.review("pr", "arch-test", Verdict::Changes, vec![comment(1, 1, "no")]).unwrap();
@@ -158,13 +158,13 @@ fn threads_outrank_reviews() {
     let tmp = std::env::temp_dir().join(format!("gate-test-rank-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let repo = tmp.join("repo");
-    std::fs::create_dir_all(tmp.join("home/.claude/skills/arch-a")).unwrap();
-    std::fs::create_dir_all(tmp.join("home/.claude/skills/arch-b")).unwrap();
+    std::fs::create_dir_all(tmp.join("reviewers")).unwrap();
+    std::fs::write(tmp.join("reviewers/arch-a.md"), "").unwrap();
+    std::fs::write(tmp.join("reviewers/arch-b.md"), "").unwrap();
     std::fs::create_dir_all(&repo).unwrap();
-    unsafe { std::env::set_var("HOME", tmp.join("home")) };
     sh(&repo, "git init -q && git config user.email t@t && git config user.name t && echo a > f && git add . && git commit -qm init");
     std::env::set_current_dir(&repo).unwrap();
-    let gate = Gate::new().unwrap();
+    let gate = Gate::new(tmp.join("reviewers")).unwrap();
     let tree = gate.open("pr", "task").unwrap();
     sh(&tree, "git config user.email t@t && git config user.name t && printf '1\\n2\\n' > g && git add . && git commit -qm g");
     let phase = || gate.status("pr").unwrap().phase();
