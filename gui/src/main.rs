@@ -1386,7 +1386,7 @@ fn inspector<'a>(pr: &'a Pr, app: &mut PaneState) -> View<'a, State> {
         Event::Commit { sha, subject, at } => Some((sha, subject, *at)),
         Event::Review { .. } => None,
     }).collect();
-    scroller(id!(commits.len() as u64), None, move |i, _, app| match i {
+    scroller(id!(), None, move |i, _, app| match i {
         0 => {
             let mut body = vec![
                 row(vec![
@@ -1434,7 +1434,7 @@ fn view<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
                 (false, true) => split + 1,
                 (false, false) => pulls.len() + 1,
             };
-            scroller(id!(count as u64), None, move |i, _, app| {
+            scroller(id!(), None, move |i, _, app| {
                 let row = match i {
                     i if i >= count => return None,
                     i if i < split => pr_row(i, &pulls[i], state, app),

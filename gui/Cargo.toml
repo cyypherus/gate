@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 gate = { version = "0.1.0", path = ".." }
-haven-ui = { git = "https://github.com/cyypherus/haven", branch = "main", version = "0.1.0" }
+haven-ui = { git = "https://github.com/cyypherus/haven", branch = "scroller-fix", version = "0.1.0" }
 notify = "8.2.0"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
