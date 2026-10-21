@@ -294,6 +294,7 @@ pub struct FileDiff {
     pub path: String,
     pub added: usize,
     pub removed: usize,
+    pub blob: String,
     pub lines: Vec<DiffLine>,
 }
 
@@ -645,16 +646,28 @@ impl Gate {
         }
         timeline.sort_by_key(Event::at);
 
+        let mut moved = BTreeMap::new();
+        for t in threads.iter().filter(|t| t.sha != head) {
+            if !moved.contains_key(&t.sha) {
+                moved.insert(t.sha.clone(), git(&self.root, &["diff", "--name-only", &t.sha, &head])?);
+            }
+        }
+        let current = |t: &Thread| t.sha == head || !moved[&t.sha].lines().any(|f| f == t.file);
+
         let mut files: Vec<FileDiff> = Vec::new();
         let (mut old, mut new, mut in_hunk) = (0, 0, false);
         for l in git(&self.root, &["diff", &format!("HEAD...gate/{slug}")])?.lines() {
             if let Some(header) = l.strip_prefix("diff --git ") {
                 let path = header.rsplit_once(" b/").map_or(header, |(_, p)| p).to_string();
-                files.push(FileDiff { path, added: 0, removed: 0, lines: Vec::new() });
+                files.push(FileDiff { path, added: 0, removed: 0, blob: String::new(), lines: Vec::new() });
                 in_hunk = false;
                 continue;
             }
             let Some(file) = files.last_mut() else { continue };
+            if let Some((_, blob)) = l.strip_prefix("index ").and_then(|i| i.split(' ').next()?.split_once("..")) {
+                file.blob = blob.to_string();
+                continue;
+            }
             let line = if let Some(h) = l.strip_prefix("@@ -") {
                 let start = |s: &str| s.split([',', ' ']).next().and_then(|n| n.parse().ok()).unwrap_or(0);
                 old = start(h);
@@ -679,7 +692,7 @@ impl Gate {
             };
             let on_line = match line {
                 Line::Added { new, .. } | Line::Context { new, .. } => (0..threads.len())
-                    .filter(|&i| threads[i].file == file.path && threads[i].end == new && (threads[i].sha == head || !matches!(threads[i].state, ThreadState::Resolved | ThreadState::Dismissed)))
+                    .filter(|&i| threads[i].file == file.path && threads[i].end == new && current(&threads[i]) && (threads[i].sha == head || !matches!(threads[i].state, ThreadState::Resolved | ThreadState::Dismissed)))
                     .collect(),
                 _ => Vec::new(),
             };

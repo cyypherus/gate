@@ -127,7 +127,7 @@ struct FileView {
     slug: String,
     path: String,
     collapsed: bool,
-    viewed: bool,
+    viewed: Option<String>,
     toggle: ButtonState,
     check: ButtonState,
 }
@@ -339,7 +339,7 @@ fn sync(state: &mut State) {
         .filter(|t| !matches!(t.state, ThreadState::Resolved | ThreadState::Dismissed))
         .map(|t| t.id)
         .collect();
-    let paths: Vec<String> = pr.files.iter().map(|f| f.path.clone()).collect();
+    let files: Vec<(String, String)> = pr.files.iter().map(|f| (f.path.clone(), f.blob.clone())).collect();
     let slug = state.selected.clone().unwrap_or_default();
     for id in active {
         if !state.drafts.iter().any(|d| d.id == id) {
@@ -347,9 +347,11 @@ fn sync(state: &mut State) {
             state.drafts.push(Draft { id, text: TextState::new(""), reply: blank, resolve: blank, uphold: blank, dismiss: blank });
         }
     }
-    for path in paths {
-        if !state.file_views.iter().any(|v| v.slug == slug && v.path == path) {
-            state.file_views.push(FileView { slug: slug.clone(), path, collapsed: false, viewed: false, toggle: ButtonState::default(), check: ButtonState::default() });
+    for (path, blob) in files {
+        match state.file_views.iter_mut().find(|v| v.slug == slug && v.path == path) {
+            Some(view) if view.viewed.as_ref().is_some_and(|v| *v != blob) => (view.viewed, view.collapsed) = (None, false),
+            Some(_) => {}
+            None => state.file_views.push(FileView { slug: slug.clone(), path, collapsed: false, viewed: None, toggle: ButtonState::default(), check: ButtonState::default() }),
         }
     }
 }
@@ -938,7 +940,7 @@ fn item_view<'a>(id: u64, item: &Item<'a>, state: &'a State, app: &mut PaneState
 
 fn file_header<'a>(index: usize, file: &'a FileDiff, state: &'a State, app: &mut PaneState) -> View<'a, State> {
     let view = &state.file_views[index];
-    let (collapsed, viewed) = (view.collapsed, view.viewed);
+    let (collapsed, viewed, blob) = (view.collapsed, view.viewed.is_some(), file.blob.clone());
     let id = index as u64;
     let toggle = button(id!(id), (&view.toggle, Binding::new(move |s: &State| &s.file_views[index].toggle, move |s: &mut State| &mut s.file_views[index].toggle)))
         .surface(|_, _| empty())
@@ -981,8 +983,8 @@ fn file_header<'a>(index: usize, file: &'a FileDiff, state: &'a State, app: &mut
         })
         .on_click(move |state, app| {
             let view = &mut state.file_views[index];
-            view.viewed = !view.viewed;
-            view.collapsed = view.viewed;
+            view.viewed = if view.viewed.is_some() { None } else { Some(blob.clone()) };
+            view.collapsed = view.viewed.is_some();
             app.redraw();
         })
         .build(app)
@@ -1234,7 +1236,7 @@ fn your_review<'a>(pull: &'a Pull, state: &'a State, app: &mut PaneState) -> Vie
         ]
     };
     let files = pull.pr.as_ref().map_or(0, |pr| pr.files.len());
-    let viewed = state.file_views.iter().filter(|v| v.slug == pull.slug && v.viewed).count();
+    let viewed = state.file_views.iter().filter(|v| v.slug == pull.slug && v.viewed.is_some()).count();
     let drafts = match count {
         0 => "no draft comments — click a line to comment".to_string(),
         1 => "1 draft comment".to_string(),
