@@ -12,6 +12,12 @@ mkdir -p ~/.gate/reviewers && ln -s "$PWD"/reviewers/*.md ~/.gate/reviewers/
 
 These commands link to this checkout instead of copying, so `git pull` gets you the latest reviewers and skill. Run the two `cargo install` lines again after pulling to update the programs.
 
+In each repo you use gate in, ignore its local state:
+
+```sh
+printf '.gate/worktrees/\n.gate/gate.db*\n' >> .gitignore
+```
+
 ## Reviewers
 
 A reviewer is a markdown file of rules. gate names it after the file, so `~/.gate/reviewers/naming.md` is the reviewer `naming`. Put rules you want everywhere in `~/.gate/reviewers`, and rules for one project in `.gate/reviewers` in that repo. If both have a file with the same name, the repo's wins. This repo comes with three to start from, linked in by the install step: `arch-correctness`, `arch-simplicity` and `arch-topology`.

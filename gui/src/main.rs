@@ -418,18 +418,18 @@ fn load(gate: &Gate, highlighter: &Highlighter, finished: &mut Vec<Pull>) -> Vec
         .unwrap_or_default()
         .into_iter()
         .map(|(slug, lifecycle)| {
-            if let Some(pull) = finished.iter().find(|p| p.slug == slug).filter(|_| !matches!(lifecycle, Lifecycle::Open(_))) {
+            if let Some(pull) = finished.iter().find(|p| p.slug == slug).filter(|_| !lifecycle.open()) {
                 return pull.clone();
             }
             let pr = gate.pr(&slug);
             let colors = pr.as_ref().map(|pr| highlighter.files(pr)).unwrap_or_default();
             let standing = match lifecycle {
-                Lifecycle::Open(_) => Standing::Open(gate.status(&slug)),
+                Lifecycle::Implementing | Lifecycle::Ready(_) => Standing::Open(gate.status(&slug)),
                 Lifecycle::Merged => Standing::Merged,
                 Lifecycle::Closed => Standing::Closed,
             };
             let pull = Pull { standing, pr, colors, slug };
-            if !matches!(lifecycle, Lifecycle::Open(_)) {
+            if !lifecycle.open() {
                 finished.push(pull.clone());
             }
             pull
@@ -808,12 +808,12 @@ fn item_view<'a>(id: u64, item: &Item<'a>, state: &'a State, app: &mut PaneState
             id,
             Some(rect(id!(id)).fill(BACKGROUND).stroke(Color::from_rgb8(58, 63, 73), Stroke::new(2.)).corner_rounding(6.).build(app).width(11.).height(11.)),
             row_spaced(10., vec![
-                text(id!(id), sha.get(..12).unwrap_or(sha)).font_family(MONO).font_size(12).fill(PURPLE).build(app),
-                text(id!(id), *subject).font_size(13).fill(TEXT).build(app),
-                text(id!(id), ago(*at)).font_size(12).fill(FAINT).build(app),
-                space(),
+                text(id!(id), sha.get(..12).unwrap_or(sha)).font_family(MONO).font_size(12).fill(PURPLE).build(app).align(Align::Top),
+                text(id!(id), *subject).font_size(13).fill(TEXT).align(Alignment::Start).wrap().build(app).expand_x(),
+                text(id!(id), ago(*at)).font_size(12).fill(FAINT).build(app).align(Align::Top),
             ])
-            .height(36.),
+            .pad_top(9.)
+            .pad_bottom(9.),
             app,
         ),
         Item::Review { reviewer, verdict, sha, at, stale } => {
@@ -1020,7 +1020,7 @@ fn merge_box<'a>(pull: &'a Pull, state: &'a State, app: &mut PaneState) -> View<
         (Some(Phase::Approved), _) => vec!["This branch can be squashed and merged.".to_string()],
         (Some(Phase::Detached), _) => vec!["The PR's worktree is not on its branch, so new commits are not reaching the PR. The implementer is moving it back.".to_string()],
         (Some(Phase::Conflicting), _) => vec!["The branch conflicts with the base branch. The implementer is merging it in and resolving it.".to_string()],
-        (Some(Phase::Implementing), _) => vec!["The implementer hasn't marked it ready for review.".to_string()],
+        (Some(Phase::Implementing), _) => vec!["The implementer hasn't marked the latest commit ready for review.".to_string()],
         (_, None) => vec!["The PR's state couldn't be read.".to_string()],
         (_, Some(status)) => {
             let threads = |n: usize| if n == 1 { "1 thread".to_string() } else { format!("{n} threads") };
@@ -1582,7 +1582,7 @@ mod tests {
         std::fs::create_dir_all(tmp.join("reviewers")).unwrap();
         std::fs::write(tmp.join("reviewers/arch-test.md"), "").unwrap();
         std::fs::create_dir_all(&repo).unwrap();
-        sh(&repo, "git init -q && git config user.email t@t && git config user.name t && echo a > f && git add . && git commit -qm init");
+        sh(&repo, "git init -q && git config user.email t@t && git config user.name t && printf '.gate/worktrees/\\n.gate/gate.db*\\n' > .gitignore && echo a > f && git add . && git commit -qm init");
         std::env::set_current_dir(&repo).unwrap();
         let gate = Gate::new(tmp.join("reviewers")).unwrap();
         let tree = gate.open("pr", "task").unwrap();

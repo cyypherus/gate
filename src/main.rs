@@ -1,5 +1,5 @@
 use clap::Parser;
-use gate::{ARBITER, IMPLEMENTER, Lifecycle, Comment, Decision, Event, Gate, Line, MessageKind, Readiness, Result, Verdict, YOU};
+use gate::{ARBITER, IMPLEMENTER, Comment, Decision, Event, Gate, Line, MessageKind, Readiness, Result, Verdict, YOU};
 use notify::Watcher;
 use std::io::IsTerminal;
 use std::process::exit;
@@ -58,7 +58,7 @@ fn run(cli: Cli) -> Result<()> {
         Cli::Open { slug, prompt } => println!("{}", gate.open(&slug, &prompt)?.display()),
         Cli::Status { slug } => println!("{}", serde_json::to_string_pretty(&gate.status(&slug)?).unwrap()),
         Cli::List => {
-            for (slug, _) in gate.slugs()?.into_iter().filter(|(_, l)| matches!(l, Lifecycle::Open(_))) {
+            for (slug, _) in gate.slugs()?.into_iter().filter(|(_, l)| l.open()) {
                 println!("{slug}\t{}", gate.status(&slug)?.phase().label());
             }
         }
@@ -81,7 +81,7 @@ fn run(cli: Cli) -> Result<()> {
             let result = loop {
                 match gate.lifecycle(&slug)? {
                     None => return Err(format!("no PR {slug}")),
-                    Some(Lifecycle::Open(_)) => {}
+                    Some(l) if l.open() => {}
                     Some(_) => break serde_json::json!({ "closed": true }),
                 }
                 if role == IMPLEMENTER {

@@ -24,7 +24,7 @@ fn review_threads_merge_close() {
     std::fs::create_dir_all(tmp.join("reviewers")).unwrap();
     std::fs::write(tmp.join("reviewers/arch-test.md"), "").unwrap();
     std::fs::create_dir_all(&repo).unwrap();
-    sh(&repo, "git init -q && git config user.email t@t && git config user.name t && echo a > f && git add . && git commit -qm init");
+    sh(&repo, "git init -q && git config user.email t@t && git config user.name t && printf '.gate/worktrees/\\n.gate/gate.db*\\n' > .gitignore && echo a > f && git add . && git commit -qm init");
     std::env::set_current_dir(&repo).unwrap();
     let gate = Gate::new(tmp.join("reviewers")).unwrap();
 
@@ -80,14 +80,14 @@ fn review_threads_merge_close() {
     gate.merge("keep", "keep: add b").unwrap();
     assert_eq!(sh(&repo, "head -1 g"), "keep");
     assert_eq!(sh(&repo, "git log -1 --format=%s"), "keep: add b");
-    assert!(!repo.join(".git/gate/keep").exists());
-    assert!(gate.slugs().unwrap() == vec![("drop".to_string(), gate::Lifecycle::Open(Readiness::Implementing)), ("keep".to_string(), gate::Lifecycle::Merged)]);
+    assert!(!repo.join(".gate/worktrees/keep").exists());
+    assert!(gate.slugs().unwrap() == vec![("drop".to_string(), gate::Lifecycle::Implementing), ("keep".to_string(), gate::Lifecycle::Merged)]);
     assert!(gate.lifecycle("keep").unwrap() == Some(gate::Lifecycle::Merged));
     assert!(gate.open("keep", "again").is_err());
     assert!(gate.lifecycle("never").unwrap().is_none());
 
     gate.close("drop").unwrap();
-    assert!(gate.slugs().unwrap().iter().all(|(_, l)| !matches!(l, gate::Lifecycle::Open(_))));
+    assert!(gate.slugs().unwrap().iter().all(|(_, l)| !l.open()));
     assert!(gate.pr("keep").unwrap().files.iter().any(|f| f.path == "g"));
     assert_eq!(sh(&repo, "git branch --list 'gate/*' --format='%(refname:short)'"), "gate/drop\ngate/keep");
     std::fs::remove_dir_all(&tmp).unwrap();
@@ -102,7 +102,7 @@ fn conflicts_need_a_sync() {
     std::fs::create_dir_all(tmp.join("reviewers")).unwrap();
     std::fs::write(tmp.join("reviewers/arch-test.md"), "").unwrap();
     std::fs::create_dir_all(&repo).unwrap();
-    sh(&repo, "git init -q -b trunk && git config user.email t@t && git config user.name t && echo a > f && git add . && git commit -qm init");
+    sh(&repo, "git init -q -b trunk && git config user.email t@t && git config user.name t && printf '.gate/worktrees/\\n.gate/gate.db*\\n' > .gitignore && echo a > f && git add . && git commit -qm init");
     std::env::set_current_dir(&repo).unwrap();
     let gate = Gate::new(tmp.join("reviewers")).unwrap();
     for slug in ["one", "two"] {
@@ -119,8 +119,9 @@ fn conflicts_need_a_sync() {
     assert!(sync.action == gate::Action::Sync && sync.base == "trunk");
     assert!(gate.merge("two", "two").is_err());
 
-    let tree = repo.join(".git/gate/two");
+    let tree = repo.join(".gate/worktrees/two");
     sh(&tree, "git merge trunk >/dev/null; echo resolved > f && git commit -qam merge-trunk");
+    gate.mark("two", IMPLEMENTER, Readiness::Ready).unwrap();
     assert!(gate.status("two").unwrap().phase() == Phase::AwaitingReview);
     assert!(gate.pr("two").unwrap().files.iter().all(|f| f.path == "f"));
     std::fs::remove_dir_all(&tmp).unwrap();
@@ -135,7 +136,7 @@ fn threads_outlive_commits() {
     std::fs::create_dir_all(tmp.join("reviewers")).unwrap();
     std::fs::write(tmp.join("reviewers/arch-test.md"), "").unwrap();
     std::fs::create_dir_all(&repo).unwrap();
-    sh(&repo, "git init -q && git config user.email t@t && git config user.name t && echo a > f && git add . && git commit -qm init");
+    sh(&repo, "git init -q && git config user.email t@t && git config user.name t && printf '.gate/worktrees/\\n.gate/gate.db*\\n' > .gitignore && echo a > f && git add . && git commit -qm init");
     std::env::set_current_dir(&repo).unwrap();
     let gate = Gate::new(tmp.join("reviewers")).unwrap();
     let tree = gate.open("pr", "task").unwrap();
@@ -148,6 +149,7 @@ fn threads_outlive_commits() {
     assert!(gate.status("pr").unwrap().phase() == Phase::Escalated);
 
     sh(&tree, "echo c > f && git commit -qam c");
+    gate.mark("pr", IMPLEMENTER, Readiness::Ready).unwrap();
     assert!(gate.status("pr").unwrap().phase() == Phase::Escalated, "a commit must not outdate the thread");
     assert!(gate.review("pr", "arch-test", Verdict::Approve, vec![]).is_err());
     gate.decide(thread, YOU, Decision::Dismiss, "fine").unwrap();
@@ -159,6 +161,8 @@ fn threads_outlive_commits() {
     assert!(gate.status("pr").unwrap().phase() == Phase::Detached);
     assert!(gate.pending("pr").unwrap()[0].action == gate::Action::Reattach);
     sh(&tree, "git checkout -q -B gate/pr");
+    assert!(gate.status("pr").unwrap().phase() == Phase::Implementing);
+    gate.mark("pr", IMPLEMENTER, Readiness::Ready).unwrap();
     assert!(gate.status("pr").unwrap().phase() == Phase::AwaitingReview);
     std::fs::remove_dir_all(&tmp).unwrap();
 }
@@ -173,7 +177,7 @@ fn threads_outrank_reviews() {
     std::fs::write(tmp.join("reviewers/arch-a.md"), "").unwrap();
     std::fs::write(tmp.join("reviewers/arch-b.md"), "").unwrap();
     std::fs::create_dir_all(&repo).unwrap();
-    sh(&repo, "git init -q && git config user.email t@t && git config user.name t && echo a > f && git add . && git commit -qm init");
+    sh(&repo, "git init -q && git config user.email t@t && git config user.name t && printf '.gate/worktrees/\\n.gate/gate.db*\\n' > .gitignore && echo a > f && git add . && git commit -qm init");
     std::env::set_current_dir(&repo).unwrap();
     let gate = Gate::new(tmp.join("reviewers")).unwrap();
     let tree = gate.open("pr", "task").unwrap();
@@ -210,31 +214,15 @@ fn invalid_lifecycles_are_refused() {
     std::fs::create_dir_all(tmp.join("reviewers")).unwrap();
     std::fs::write(tmp.join("reviewers/arch-test.md"), "").unwrap();
     std::fs::create_dir_all(&repo).unwrap();
-    sh(&repo, "git init -q && git config user.email t@t && git config user.name t && echo a > f && git add . && git commit -qm init");
+    sh(&repo, "git init -q && git config user.email t@t && git config user.name t && printf '.gate/worktrees/\\n.gate/gate.db*\\n' > .gitignore && echo a > f && git add . && git commit -qm init");
     std::env::set_current_dir(&repo).unwrap();
     let base = sh(&repo, "git rev-parse HEAD");
-
-    std::fs::create_dir_all(repo.join(".git/gate")).unwrap();
-    let db = rusqlite::Connection::open(repo.join(".git/gate/gate.db")).unwrap();
-    db.execute_batch(&format!(
-        "CREATE TABLE prs (slug TEXT PRIMARY KEY, base TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'open', readiness TEXT NOT NULL DEFAULT 'ready');
-         CREATE TABLE reviews (id INTEGER PRIMARY KEY, slug TEXT NOT NULL REFERENCES prs(slug) ON DELETE CASCADE, sha TEXT NOT NULL, reviewer TEXT NOT NULL, verdict TEXT NOT NULL, at INTEGER NOT NULL);
-         INSERT INTO prs VALUES ('old-ready', '{base}', 'p', 'open', 'ready'), ('old-impl', '{base}', 'p', 'open', 'implementing'), ('old-merged', '{base}', 'p', 'merged', 'implementing'), ('old-closed', '{base}', 'p', 'closed', 'ready');
-         INSERT INTO reviews VALUES (1, 'old-merged', 'x', 'arch-test', 'approve', 0);"
-    ))
-    .unwrap();
-    drop(db);
     let gate = Gate::new(tmp.join("reviewers")).unwrap();
-    assert!(gate.lifecycle("old-ready").unwrap() == Some(Lifecycle::Open(Readiness::Ready)));
-    assert!(gate.lifecycle("old-impl").unwrap() == Some(Lifecycle::Open(Readiness::Implementing)));
-    assert!(gate.lifecycle("old-merged").unwrap() == Some(Lifecycle::Merged));
-    assert!(gate.lifecycle("old-closed").unwrap() == Some(Lifecycle::Closed));
 
-    let db = rusqlite::Connection::open(repo.join(".git/gate/gate.db")).unwrap();
-    assert_eq!(db.query_row("SELECT count(*) FROM reviews", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
-    for bad in ["open", "Ready", "merged-ready", ""] {
-        assert!(db.execute("UPDATE prs SET lifecycle = ?1 WHERE slug = 'old-ready'", [bad]).is_err(), "{bad}");
-        assert!(db.execute("INSERT INTO prs (slug, base, prompt, lifecycle) VALUES ('x', 'b', 'p', ?1)", [bad]).is_err(), "{bad}");
+    let db = rusqlite::Connection::open(repo.join(".gate/gate.db")).unwrap();
+    let insert = |lifecycle: &str, ready_at: Option<&str>| db.execute("INSERT INTO prs (slug, base, prompt, lifecycle, ready_at) VALUES (?1, 'b', 'p', ?1, ?2)", rusqlite::params![lifecycle, ready_at]);
+    for (lifecycle, ready_at) in [("open", None), ("Ready", Some("x")), ("merged-ready", None), ("", None), ("ready", None), ("implementing", Some("x")), ("merged", Some("x")), ("closed", Some("x"))] {
+        assert!(insert(lifecycle, ready_at).is_err(), "{lifecycle} {ready_at:?}");
     }
     for gone in ["state", "readiness"] {
         assert!(db.prepare(&format!("SELECT {gone} FROM prs")).is_err(), "{gone}");
@@ -250,8 +238,17 @@ fn invalid_lifecycles_are_refused() {
     gate.review("pr", "arch-test", Verdict::Changes, vec![comment(1, 1, "no")]).unwrap();
     let thread = gate.status("pr").unwrap().open[0];
 
+    let marked = gate.status("pr").unwrap();
+    assert!(marked.phase() == Phase::ChangesRequested);
+    sh(&tree, "echo fix > f && git commit -qam fix");
+    assert!(gate.status("pr").unwrap().phase() == Phase::Implementing, "commit after ready");
+    assert!(gate.pending("pr").unwrap().iter().all(|w| w.role == IMPLEMENTER && w.action == gate::Action::Implement));
+    assert!(gate.reply(thread, IMPLEMENTER, "fixed").is_err());
+    gate.mark("pr", IMPLEMENTER, Readiness::Ready).unwrap();
+    gate.reply(thread, IMPLEMENTER, "fixed").unwrap();
+
     sh(&tree, &format!("git reset -q --hard {base}"));
-    assert!(gate.lifecycle("pr").unwrap() == Some(Lifecycle::Open(Readiness::Ready)));
+    assert!(matches!(gate.lifecycle("pr").unwrap(), Some(Lifecycle::Ready(_))));
     assert!(gate.status("pr").unwrap().phase() == Phase::Implementing, "ready with no commits");
     assert!(gate.pending("pr").unwrap().iter().all(|w| w.role == IMPLEMENTER && w.action == gate::Action::Implement));
     assert!(gate.review("pr", "arch-test", Verdict::Approve, vec![]).is_err());
@@ -266,7 +263,6 @@ fn invalid_lifecycles_are_refused() {
     assert!(gate.merge("pr", "m").is_err());
     gate.close("pr").unwrap();
     assert!(gate.mark("pr", IMPLEMENTER, Readiness::Ready).is_err(), "ready after close");
-    assert!(gate.mark("old-merged", IMPLEMENTER, Readiness::Implementing).is_err(), "implementing after merge");
     assert!(gate.lifecycle("pr").unwrap() == Some(Lifecycle::Closed));
 
     let tree = gate.open("gone", "task").unwrap();

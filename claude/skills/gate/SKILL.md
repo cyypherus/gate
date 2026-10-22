@@ -13,7 +13,7 @@ Run `gate open <slug> "<prompt>"`. It prints the PR's worktree. Do every edit an
 
 ## 2. Implement
 
-Implement the prompt in the worktree and commit. When the change is complete, run `gate mark <slug> ready --as implementer`; reviewers start only then. To pull it back from review for more work, run `gate mark <slug> implementing --as implementer`.
+Implement the prompt in the worktree and commit. When the change is complete, run `gate mark <slug> ready --as implementer`; reviewers start only then. Readiness belongs to the commit it was marked on: every new commit, including fixes and merges, puts the PR back to implementing until you mark it ready again. To pull it back from review for more work, run `gate mark <slug> implementing --as implementer`.
 
 ## 3. Wait
 
@@ -23,11 +23,11 @@ Repeat until the PR closes:
 2. `{"closed":true}`: the PR was merged or closed. Stop and give the user one line.
 3. `{"start":[...]}`: these roles have work and no live agent. Start each as a background agent with the Agent tool, using the prompts in section 4: `arbiter` is the arbiter (subagent type `gate-arbiter`, model `--arbiter-model`, else `--model`); any other name is a reviewer (subagent type `general-purpose`, model `--model`). Then wait again.
 4. `action` and `threads`:
-   - `implement`: the PR is marked implementing. Do section 2, ending with `gate mark <slug> ready --as implementer`.
+   - `implement`: the PR's latest commit is not marked ready. Finish the work, then `gate mark <slug> ready --as implementer`. Nobody can review, reply or dispute until you do.
    - `reattach`: the worktree is not on its branch `gate/<slug>`, so your commits are not reaching the PR. If the worktree's HEAD already contains the branch's commits, run `git checkout -B gate/<slug>` in it; otherwise check out `gate/<slug>` and cherry-pick the missing commits. Never leave the worktree detached.
    - `sync`: your branch conflicts with the base branch. In the worktree run `git merge <base>`, resolve every conflict, and commit the merge.
    - `answer`: the human left comments on these threads. Read them with `gate show <slug>`, change the code if a comment calls for it (commit), and reply to each with `gate reply <thread> --as implementer "<message>"`.
-   - `fix`: address every listed thread before anything else. For each, either fix it in code and reply with `gate reply <thread> --as implementer "<what you changed>"`, reply to explain or ask, or dispute with `gate dispute <thread> "<argument>"` when you are confident it is wrong. A fix without a reply leaves the thread open. Commit all fixes together. An upheld ruling is final: fix it and reply.
+   - `fix`: address every listed thread before anything else. For each, either fix it in code and reply with `gate reply <thread> --as implementer "<what you changed>"`, reply to explain or ask, or dispute with `gate dispute <thread> "<argument>"` when you are confident it is wrong. A fix without a reply leaves the thread open. Commit all fixes together, mark the PR ready, then reply. An upheld ruling is final: fix it and reply.
 
 Every action must change gate's state (a commit, review, reply, dispute, resolve or ruling); otherwise `gate wait` hands you the same work again. Never stop waiting for any reason other than `closed` or an error from `gate`. `gate` tracks which agents are alive and tells you when one must be started, so never start agents on your own.
 
