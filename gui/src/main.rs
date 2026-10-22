@@ -255,7 +255,7 @@ const APPROVED_ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox=
 
 fn phase_color(phase: Phase) -> Color {
     match phase {
-        Phase::Unimplemented => MUTED,
+        Phase::Implementing => MUTED,
         Phase::Detached | Phase::Conflicting => RED,
         Phase::Discussing => CYAN,
         Phase::Escalated => RED,
@@ -418,18 +418,18 @@ fn load(gate: &Gate, highlighter: &Highlighter, finished: &mut Vec<Pull>) -> Vec
         .unwrap_or_default()
         .into_iter()
         .map(|(slug, lifecycle)| {
-            if let Some(pull) = finished.iter().find(|p| p.slug == slug).filter(|_| lifecycle != Lifecycle::Open) {
+            if let Some(pull) = finished.iter().find(|p| p.slug == slug).filter(|_| !matches!(lifecycle, Lifecycle::Open(_))) {
                 return pull.clone();
             }
             let pr = gate.pr(&slug);
             let colors = pr.as_ref().map(|pr| highlighter.files(pr)).unwrap_or_default();
             let standing = match lifecycle {
-                Lifecycle::Open => Standing::Open(gate.status(&slug)),
+                Lifecycle::Open(_) => Standing::Open(gate.status(&slug)),
                 Lifecycle::Merged => Standing::Merged,
                 Lifecycle::Closed => Standing::Closed,
             };
             let pull = Pull { standing, pr, colors, slug };
-            if lifecycle != Lifecycle::Open {
+            if !matches!(lifecycle, Lifecycle::Open(_)) {
                 finished.push(pull.clone());
             }
             pull
@@ -1011,7 +1011,7 @@ fn merge_box<'a>(pull: &'a Pull, state: &'a State, app: &mut PaneState) -> View<
         Some(Phase::ChangesRequested) => "Changes requested",
         Some(Phase::Detached) => "Off branch",
         Some(Phase::Conflicting) => "Conflicting",
-        Some(Phase::Unimplemented) => "Unimplemented",
+        Some(Phase::Implementing) => "Implementing",
         Some(Phase::AwaitingYou) => "Awaiting your review",
         Some(Phase::Discussing) => "Discussing",
         None => "Unknown",
@@ -1020,7 +1020,7 @@ fn merge_box<'a>(pull: &'a Pull, state: &'a State, app: &mut PaneState) -> View<
         (Some(Phase::Approved), _) => vec!["This branch can be squashed and merged.".to_string()],
         (Some(Phase::Detached), _) => vec!["The PR's worktree is not on its branch, so new commits are not reaching the PR. The implementer is moving it back.".to_string()],
         (Some(Phase::Conflicting), _) => vec!["The branch conflicts with the base branch. The implementer is merging it in and resolving it.".to_string()],
-        (Some(Phase::Unimplemented), _) => vec!["The implementer hasn't committed yet.".to_string()],
+        (Some(Phase::Implementing), _) => vec!["The implementer hasn't marked it ready for review.".to_string()],
         (_, None) => vec!["The PR's state couldn't be read.".to_string()],
         (_, Some(status)) => {
             let threads = |n: usize| if n == 1 { "1 thread".to_string() } else { format!("{n} threads") };
@@ -1587,6 +1587,7 @@ mod tests {
         let gate = Gate::new(tmp.join("reviewers")).unwrap();
         let tree = gate.open("pr", "task").unwrap();
         sh(&tree, "git config user.email t@t && git config user.name t && echo b > f && git commit -qam b");
+        gate.mark("pr", IMPLEMENTER, gate::Readiness::Ready).unwrap();
         gate.review("pr", "arch-test", Verdict::Approve, vec![]).unwrap();
         assert!(gate.status("pr").unwrap().phase() == Phase::AwaitingYou);
 

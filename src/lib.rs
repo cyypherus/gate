@@ -16,7 +16,6 @@ pub const ARBITER: &str = "arbiter";
 const SCHEMA: &str = "
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
-CREATE TABLE IF NOT EXISTS prs (slug TEXT PRIMARY KEY, base TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'open');
 CREATE TABLE IF NOT EXISTS reviews (
     id INTEGER PRIMARY KEY,
     slug TEXT NOT NULL REFERENCES prs(slug) ON DELETE CASCADE,
@@ -51,6 +50,13 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 ";
 
+const PRS: &str = "(
+    slug TEXT PRIMARY KEY,
+    base TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    lifecycle TEXT NOT NULL DEFAULT 'implementing' CHECK (lifecycle IN ('implementing', 'ready', 'merged', 'closed'))
+)";
+
 const IDLE_STALE: i64 = 1800;
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -70,11 +76,36 @@ impl Verdict {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum Lifecycle {
-    Open,
+    Open(Readiness),
     Merged,
     Closed,
+}
+
+impl Lifecycle {
+    fn key(self) -> &'static str {
+        match self {
+            Lifecycle::Open(Readiness::Implementing) => "implementing",
+            Lifecycle::Open(Readiness::Ready) => "ready",
+            Lifecycle::Merged => "merged",
+            Lifecycle::Closed => "closed",
+        }
+    }
+
+    fn parse(text: &str) -> Result<Lifecycle> {
+        match text {
+            "merged" => Ok(Lifecycle::Merged),
+            "closed" => Ok(Lifecycle::Closed),
+            _ => parse(text).map(Lifecycle::Open),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+pub enum Readiness {
+    Implementing,
+    Ready,
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -201,7 +232,7 @@ pub struct Waiting {
 #[derive(Clone, PartialEq, Serialize)]
 pub struct Status {
     pub worktree: PathBuf,
-    pub implemented: bool,
+    pub reviewable: bool,
     pub awaiting: Vec<String>,
     pub open: Vec<i64>,
     pub waiting: Vec<Waiting>,
@@ -215,7 +246,7 @@ pub struct Status {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Phase {
-    Unimplemented,
+    Implementing,
     Detached,
     Conflicting,
     Escalated,
@@ -230,7 +261,7 @@ pub enum Phase {
 impl Status {
     pub fn phase(&self) -> Phase {
         match () {
-            _ if !self.implemented => Phase::Unimplemented,
+            _ if !self.reviewable => Phase::Implementing,
             _ if self.detached => Phase::Detached,
             _ if self.conflicting => Phase::Conflicting,
             _ if !self.escalated.is_empty() => Phase::Escalated,
@@ -247,7 +278,7 @@ impl Status {
 impl Phase {
     pub fn label(self) -> &'static str {
         match self {
-            Phase::Unimplemented => "unimplemented",
+            Phase::Implementing => "implementing",
             Phase::Detached => "off branch",
             Phase::Conflicting => "conflicting",
             Phase::Escalated => "escalated",
@@ -352,9 +383,27 @@ impl Gate {
         let db = Connection::open(store.join("gate.db")).map_err(sql)?;
         db.busy_timeout(Duration::from_secs(10)).map_err(sql)?;
         db.execute_batch(SCHEMA).map_err(sql)?;
-        let has_state: bool = db.prepare("SELECT 1 FROM pragma_table_info('prs') WHERE name = 'state'").and_then(|mut q| q.exists([])).map_err(sql)?;
-        if !has_state {
-            db.execute("ALTER TABLE prs ADD COLUMN state TEXT NOT NULL DEFAULT 'open'", []).map_err(sql)?;
+        let columns: Vec<String> = db
+            .prepare("SELECT name FROM pragma_table_info('prs')")
+            .and_then(|mut q| q.query_map([], |r| r.get(0))?.collect())
+            .map_err(sql)?;
+        let has = |c: &str| columns.iter().any(|n| n == c);
+        if columns.is_empty() {
+            db.execute_batch(&format!("CREATE TABLE prs {PRS};")).map_err(sql)?;
+        } else if !has("lifecycle") {
+            let state = if has("state") { "state" } else { "'open'" };
+            let readiness = if has("readiness") { "readiness" } else { "'ready'" };
+            db.execute_batch(&format!(
+                "PRAGMA foreign_keys = OFF;
+                 BEGIN;
+                 CREATE TABLE prs_lifecycle {PRS};
+                 INSERT INTO prs_lifecycle SELECT slug, base, prompt, CASE {state} WHEN 'open' THEN {readiness} ELSE {state} END FROM prs;
+                 DROP TABLE prs;
+                 ALTER TABLE prs_lifecycle RENAME TO prs;
+                 COMMIT;
+                 PRAGMA foreign_keys = ON;"
+            ))
+            .map_err(sql)?;
         }
         Ok(Gate { root, store, reviewers, db })
     }
@@ -363,18 +412,23 @@ impl Gate {
         self.store.join(slug)
     }
 
-    fn base(&self, slug: &str) -> Result<(String, String)> {
-        match self.lifecycle(slug)? {
+    fn base(&self, slug: &str) -> Result<(String, Readiness)> {
+        let readiness = match self.lifecycle(slug)? {
             None => return Err(format!("no PR {slug}")),
-            Some(Lifecycle::Open) => {}
-            Some(state) => return Err(format!("{slug} is {}", key(state))),
-        }
-        self.db.query_row("SELECT base, prompt FROM prs WHERE slug = ?1", [slug], |r| Ok((r.get(0)?, r.get(1)?))).map_err(sql)
+            Some(Lifecycle::Open(readiness)) => readiness,
+            Some(state) => return Err(format!("{slug} is {}", state.key())),
+        };
+        let base = self.db.query_row("SELECT base FROM prs WHERE slug = ?1", [slug], |r| r.get(0)).map_err(sql)?;
+        Ok((base, readiness))
+    }
+
+    fn has_commits(&self, base: &str, slug: &str) -> Result<bool> {
+        Ok(!git(&self.root, &["rev-list", "-1", &format!("{base}..gate/{slug}")])?.is_empty())
     }
 
     pub fn lifecycle(&self, slug: &str) -> Result<Option<Lifecycle>> {
-        let state: Option<String> = self.db.query_row("SELECT state FROM prs WHERE slug = ?1", [slug], |r| r.get(0)).optional().map_err(sql)?;
-        state.map(|s| parse(&s)).transpose()
+        let state: Option<String> = self.db.query_row("SELECT lifecycle FROM prs WHERE slug = ?1", [slug], |r| r.get(0)).optional().map_err(sql)?;
+        state.map(|s| Lifecycle::parse(&s)).transpose()
     }
 
     fn head(&self, slug: &str) -> Result<String> {
@@ -465,16 +519,16 @@ impl Gate {
     }
 
     pub fn slugs(&self) -> Result<Vec<(String, Lifecycle)>> {
-        let mut statement = self.db.prepare("SELECT slug, state FROM prs ORDER BY state != 'open', slug").map_err(sql)?;
+        let mut statement = self.db.prepare("SELECT slug, lifecycle FROM prs ORDER BY lifecycle IN ('merged', 'closed'), slug").map_err(sql)?;
         let rows: Vec<(String, String)> = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(sql)?.collect::<std::result::Result<_, _>>().map_err(sql)?;
-        rows.into_iter().map(|(slug, state)| Ok((slug, parse(&state)?))).collect()
+        rows.into_iter().map(|(slug, state)| Ok((slug, Lifecycle::parse(&state)?))).collect()
     }
 
     pub fn open(&self, slug: &str, prompt: &str) -> Result<PathBuf> {
         let tree = self.worktree(slug);
         match self.lifecycle(slug)? {
-            Some(Lifecycle::Open) => {}
-            Some(state) => return Err(format!("{slug} was {}; open the task under a new slug", key(state))),
+            Some(Lifecycle::Open(_)) => {}
+            Some(state) => return Err(format!("{slug} was {}; open the task under a new slug", state.key())),
             None => {
                 let base = git(&self.root, &["rev-parse", "--verify", "HEAD"]).map_err(|_| "the repository has no commits yet; make an initial commit first".to_string())?;
                 git(&self.root, &["worktree", "add", "-b", &format!("gate/{slug}"), &tree.to_string_lossy(), &base])?;
@@ -485,7 +539,8 @@ impl Gate {
     }
 
     pub fn status(&self, slug: &str) -> Result<Status> {
-        let (base, _) = self.base(slug)?;
+        let (base, readiness) = self.base(slug)?;
+        let has_commits = self.has_commits(&base, slug)?;
         let head = self.head(slug)?;
         let reviews = self.reviews(slug)?;
         let latest = |reviewer: &str| reviews.iter().rev().find(|r| r.sha == head && r.reviewer == reviewer).map(|r| r.verdict);
@@ -502,14 +557,14 @@ impl Gate {
             .collect();
         let mut status = Status {
             worktree: self.worktree(slug),
-            implemented: !base.starts_with(&head),
+            reviewable: readiness == Readiness::Ready && has_commits,
             awaiting,
             open: Vec::new(),
             waiting: Vec::new(),
             disputed: Vec::new(),
             escalated: Vec::new(),
             awaiting_you: latest(YOU) != Some(Verdict::Approve),
-            conflicting: !base.starts_with(&head) && self.conflicts(slug)?,
+            conflicting: has_commits && self.conflicts(slug)?,
             detached: git(&self.worktree(slug), &["symbolic-ref", "-q", "--short", "HEAD"]).ok().as_deref() != Some(&format!("gate/{slug}")),
             comments: Vec::new(),
         };
@@ -536,7 +591,7 @@ impl Gate {
             push(IMPLEMENTER, Action::Reattach, Vec::new());
             return Ok(work);
         }
-        if !status.implemented {
+        if !status.reviewable {
             push(IMPLEMENTER, Action::Implement, Vec::new());
             return Ok(work);
         }
@@ -561,6 +616,25 @@ impl Gate {
             push(ARBITER, Action::Rule, status.disputed.clone());
         }
         Ok(work)
+    }
+
+    fn reviewable(&self, slug: &str) -> Result<()> {
+        match self.base(slug)? {
+            (base, Readiness::Ready) if self.has_commits(&base, slug)? => Ok(()),
+            (_, Readiness::Ready) => Err(format!("{slug} has no commits to review")),
+            (_, Readiness::Implementing) => Err(format!("{slug} is implementing; wait until it is marked ready")),
+        }
+    }
+
+    pub fn mark(&self, slug: &str, by: &str, readiness: Readiness) -> Result<()> {
+        if by != IMPLEMENTER {
+            return Err("only the implementer marks readiness".to_string());
+        }
+        let (base, _) = self.base(slug)?;
+        if readiness == Readiness::Ready && !self.has_commits(&base, slug)? {
+            return Err(format!("{slug} has no commits to review"));
+        }
+        self.db.execute("UPDATE prs SET lifecycle = ?1 WHERE slug = ?2", params![Lifecycle::Open(readiness).key(), slug]).map(|_| ()).map_err(sql)
     }
 
     fn conflicts(&self, slug: &str) -> Result<bool> {
@@ -733,11 +807,8 @@ impl Gate {
         if let Some(c) = comments.iter().find(|c| c.start == 0 || c.end < c.start) {
             return Err(format!("{}: invalid line range {}-{}", c.file, c.start, c.end));
         }
-        let (base, _) = self.base(slug)?;
+        self.reviewable(slug)?;
         let head = self.head(slug)?;
-        if base.starts_with(&head) {
-            return Err(format!("{slug} has no commits to review"));
-        }
         let at = now();
         self.db
             .execute("INSERT INTO reviews (slug, sha, reviewer, verdict, at) VALUES (?1, ?2, ?3, ?4, ?5)", params![slug, head, reviewer, key(verdict), at])
@@ -751,7 +822,8 @@ impl Gate {
     }
 
     pub fn reply(&self, thread: i64, author: &str, body: &str) -> Result<()> {
-        let (_, t) = self.thread(thread)?;
+        let (slug, t) = self.thread(thread)?;
+        self.reviewable(&slug)?;
         if author != YOU && author != IMPLEMENTER && !self.rules()?.contains_key(author) {
             return Err(format!("unknown author {author}"));
         }
@@ -762,7 +834,8 @@ impl Gate {
     }
 
     pub fn dispute(&self, thread: i64, argument: &str) -> Result<()> {
-        let (_, t) = self.thread(thread)?;
+        let (slug, t) = self.thread(thread)?;
+        self.reviewable(&slug)?;
         if t.state != ThreadState::Open {
             return Err(format!("thread {thread} is {}, not open", t.state.label()));
         }
@@ -770,7 +843,8 @@ impl Gate {
     }
 
     pub fn decide(&self, thread: i64, by: &str, decision: Decision, reason: &str) -> Result<()> {
-        let (_, t) = self.thread(thread)?;
+        let (slug, t) = self.thread(thread)?;
+        self.reviewable(&slug)?;
         match (by, t.state) {
             (ARBITER, ThreadState::Disputed) if decision == Decision::Dismiss && t.reviewer == YOU => {
                 Err("the arbiter can't dismiss your comments; uphold or escalate".to_string())
@@ -783,7 +857,8 @@ impl Gate {
     }
 
     pub fn resolve(&self, thread: i64, by: &str) -> Result<()> {
-        let (_, t) = self.thread(thread)?;
+        let (slug, t) = self.thread(thread)?;
+        self.reviewable(&slug)?;
         if by != YOU && by != t.reviewer {
             return Err(format!("only {} or you can resolve thread {thread}", t.reviewer));
         }
@@ -821,7 +896,7 @@ impl Gate {
     }
 
     fn finish(&self, slug: &str, end: Lifecycle) -> Result<()> {
-        self.db.execute("UPDATE prs SET state = ?1 WHERE slug = ?2", params![key(end), slug]).map(|_| ()).map_err(sql)
+        self.db.execute("UPDATE prs SET lifecycle = ?1 WHERE slug = ?2", params![end.key(), slug]).map(|_| ()).map_err(sql)
     }
 }
 

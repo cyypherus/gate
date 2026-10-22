@@ -1,5 +1,5 @@
 use clap::Parser;
-use gate::{ARBITER, IMPLEMENTER, Lifecycle, Comment, Decision, Event, Gate, Line, MessageKind, Result, Verdict, YOU};
+use gate::{ARBITER, IMPLEMENTER, Lifecycle, Comment, Decision, Event, Gate, Line, MessageKind, Readiness, Result, Verdict, YOU};
 use notify::Watcher;
 use std::io::IsTerminal;
 use std::process::exit;
@@ -11,6 +11,12 @@ enum Cli {
     Show { slug: String },
     List,
     Reviewers,
+    Mark {
+        slug: String,
+        readiness: Readiness,
+        #[arg(long = "as")]
+        by: String,
+    },
     Wait {
         slug: String,
         #[arg(long = "as")]
@@ -52,7 +58,7 @@ fn run(cli: Cli) -> Result<()> {
         Cli::Open { slug, prompt } => println!("{}", gate.open(&slug, &prompt)?.display()),
         Cli::Status { slug } => println!("{}", serde_json::to_string_pretty(&gate.status(&slug)?).unwrap()),
         Cli::List => {
-            for (slug, _) in gate.slugs()?.into_iter().filter(|(_, l)| *l == Lifecycle::Open) {
+            for (slug, _) in gate.slugs()?.into_iter().filter(|(_, l)| matches!(l, Lifecycle::Open(_))) {
                 println!("{slug}\t{}", gate.status(&slug)?.phase().label());
             }
         }
@@ -75,7 +81,7 @@ fn run(cli: Cli) -> Result<()> {
             let result = loop {
                 match gate.lifecycle(&slug)? {
                     None => return Err(format!("no PR {slug}")),
-                    Some(Lifecycle::Open) => {}
+                    Some(Lifecycle::Open(_)) => {}
                     Some(_) => break serde_json::json!({ "closed": true }),
                 }
                 if role == IMPLEMENTER {
@@ -96,6 +102,7 @@ fn run(cli: Cli) -> Result<()> {
             gate.register(&slug, &role, None)?;
             println!("{result}");
         }
+        Cli::Mark { slug, readiness, by } => gate.mark(&slug, &by, readiness)?,
         Cli::Review { slug, reviewer, verdict, comments } => gate.review(&slug, &reviewer, verdict, comments)?,
         Cli::Reply { thread, author, body } => {
             not_you(&author)?;
