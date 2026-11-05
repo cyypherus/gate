@@ -12,3 +12,9 @@ serde_json = "1.0.151"
 
 [workspace]
 members = ["gui"]
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[patch."https://github.com/cyypherus/haven"]
+haven-ui = { path = "../haven" }

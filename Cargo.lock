@@ -1258,7 +1258,6 @@ dependencies = [
 [[package]]
 name = "haven-ui"
 version = "0.1.0"
-source = "git+https://github.com/cyypherus/haven?branch=scroller-fix#c4ade4af9b257b976b045691b82cc50c1459d1c8"
 dependencies = [
  "anyrender",
  "anyrender_svg",

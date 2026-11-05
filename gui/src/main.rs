@@ -5,6 +5,8 @@ use notify::Watcher;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Theme;
 use syntect::parsing::SyntaxSet;
+use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::{process, thread};
@@ -19,6 +21,11 @@ enum Tab {
 struct Pull {
     slug: String,
     standing: Standing,
+    detail: Option<Detail>,
+}
+
+#[derive(Clone, PartialEq)]
+struct Detail {
     pr: gate::Result<Pr>,
     colors: Vec<Vec<Spans>>,
 }
@@ -31,6 +38,10 @@ enum Standing {
 }
 
 impl Pull {
+    fn pr(&self) -> Option<&Pr> {
+        self.detail.as_ref().and_then(|d| d.pr.as_ref().ok())
+    }
+
     fn open(&self) -> bool {
         matches!(self.standing, Standing::Open(_))
     }
@@ -128,8 +139,95 @@ struct FileView {
     path: String,
     collapsed: bool,
     viewed: Option<String>,
-    toggle: ButtonState,
     check: ButtonState,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FilterMode {
+    Hide,
+    Only,
+}
+
+struct Filter {
+    pattern: String,
+    on: bool,
+}
+
+#[derive(Default)]
+struct Folder<'a> {
+    folders: BTreeMap<&'a str, Folder<'a>>,
+    files: Vec<&'a FileDiff>,
+}
+
+enum TreeRow<'a> {
+    Folder { path: String, label: String, depth: usize, count: usize, open: bool },
+    File { file: &'a FileDiff, depth: usize },
+}
+
+impl<'a> Folder<'a> {
+    fn count(&self) -> usize {
+        self.files.len() + self.folders.values().map(Folder::count).sum::<usize>()
+    }
+
+    fn rows(&self, prefix: &str, depth: usize, closed: &[String], rows: &mut Vec<TreeRow<'a>>) {
+        for (name, folder) in &self.folders {
+            let (mut path, mut folder) = (format!("{prefix}{name}"), folder);
+            while let (true, Some((name, inner))) = (folder.files.is_empty() && folder.folders.len() == 1, folder.folders.iter().next()) {
+                path = format!("{path}/{name}");
+                folder = inner;
+            }
+            let open = !closed.contains(&path);
+            rows.push(TreeRow::Folder { label: path[prefix.len()..].to_string(), path: path.clone(), depth, count: folder.count(), open });
+            if open {
+                folder.rows(&format!("{path}/"), depth + 1, closed, rows);
+            }
+        }
+        rows.extend(self.files.iter().map(|&file| TreeRow::File { file, depth }));
+    }
+}
+
+fn glob(pattern: &[u8], path: &[u8]) -> bool {
+    match pattern {
+        [] => path.is_empty(),
+        [b'*', b'*', b'/', rest @ ..] => (0..=path.len()).any(|i| (i == 0 || path[i - 1] == b'/') && glob(rest, &path[i..])),
+        [b'*', b'*', rest @ ..] => (0..=path.len()).any(|i| glob(rest, &path[i..])),
+        [b'*', rest @ ..] => (0..=path.iter().position(|&c| c == b'/').unwrap_or(path.len())).any(|i| glob(rest, &path[i..])),
+        [b'?', rest @ ..] => path.first().is_some_and(|&c| c != b'/') && glob(rest, &path[1..]),
+        [c, rest @ ..] => path.first() == Some(c) && glob(rest, &path[1..]),
+    }
+}
+
+fn matches(pattern: &str, path: &str, match_case: bool) -> bool {
+    let fold = |s: &str| if match_case { s.to_string() } else { s.to_lowercase() };
+    let (pattern, path) = (fold(pattern.trim()), fold(path));
+    let (anchored, pattern) = match pattern.strip_prefix('/') {
+        Some(rest) => (true, rest),
+        None => (false, pattern.as_str()),
+    };
+    let pattern = match pattern.strip_suffix('/') {
+        Some(folder) => format!("{folder}/**"),
+        None => pattern.to_string(),
+    };
+    let ends: Vec<usize> = path.match_indices('/').map(|(i, _)| i).chain([path.len()]).collect();
+    let mut starts = std::iter::once(0).chain(path.match_indices('/').map(|(i, _)| i + 1).filter(|_| !anchored));
+    !pattern.is_empty() && starts.any(|s| ends.iter().any(|&e| e >= s && glob(pattern.as_bytes(), &path.as_bytes()[s..e])))
+}
+
+fn hidden(state: &State, path: &str) -> bool {
+    let mut on = state.filters.iter().filter(|f| f.on).peekable();
+    on.peek().is_some() && on.any(|f| matches(&f.pattern, path, state.match_case)) == (state.filter_mode == FilterMode::Hide)
+}
+
+fn add_filter(state: &mut State) {
+    let pattern = state.filter_draft.text.trim().to_string();
+    if !pattern.is_empty() && !state.filters.iter().any(|f| f.pattern == pattern) {
+        state.filters.push(Filter { pattern, on: true });
+    }
+    state.filter_draft = TextState::new("");
+}
+
+fn files_scroller(slug: &str) -> u64 {
+    id!(const_hash(slug, 0, 0))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -149,6 +247,7 @@ enum Request {
 enum Job {
     Start(PaneWaker),
     Changed,
+    Select(String),
     Run(Request),
 }
 
@@ -189,6 +288,13 @@ struct State {
     finished_toggle: ButtonState,
     notice: Option<String>,
     repo: String,
+    filters: Vec<Filter>,
+    filter_mode: FilterMode,
+    match_case: bool,
+    filter_draft: TextState,
+    peek: bool,
+    closed: Vec<String>,
+    buttons: BTreeMap<u64, ButtonState>,
 }
 
 enum Item<'a> {
@@ -198,10 +304,11 @@ enum Item<'a> {
     Thread(&'a Thread),
     File(&'a FileDiff, usize),
     Line(&'a str, &'a DiffLine, &'a [(String, [u8; 3])]),
-    Pending(&'a Comment),
+    Pending(usize, &'a Comment),
     Composer,
     Merge(&'a Pull),
     Fold { reviewer: &'a str, at: i64, count: usize, open: bool },
+    Hidden { count: usize, added: usize, removed: usize },
 }
 
 const BACKGROUND: Color = Color::from_rgb8(8, 9, 11);
@@ -230,6 +337,18 @@ const CLOSED_CHEVRON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox
 fn chevron<'a>(id: u64, open: bool, app: &mut PaneState) -> View<'a, State> {
     svg(id!(id), if open { OPEN_CHEVRON } else { CLOSED_CHEVRON }).finish(app).width(12.).height(12.)
 }
+fn clickable<'a>(id: u64, state: &State, content: impl Fn(&mut PaneState) -> View<'a, State> + 'a, on_click: impl Fn(&mut State, &mut PaneState) + 'static, app: &mut PaneState) -> View<'a, State> {
+    static IDLE: ButtonState = ButtonState { hovered: false, depressed: false };
+    button(id!(id), (state.buttons.get(&id).unwrap_or(&IDLE), Binding::new(move |s: &State| s.buttons.get(&id).unwrap_or(&IDLE), move |s: &mut State| s.buttons.entry(id).or_default())))
+        .surface(move |button, app| rect(id!(id)).fill(if button.hovered { HOVER } else { TRANSPARENT }).corner_rounding(6.).build(app))
+        .label(move |_, app| content(app))
+        .on_click(move |state, app| {
+            on_click(state, app);
+            app.redraw();
+        })
+        .build(app)
+}
+
 const FONTS: [(&[u8], &str); 6] = [
     (include_bytes!("../fonts/Geist-Regular.ttf"), SANS),
     (include_bytes!("../fonts/Geist-Medium.ttf"), SANS),
@@ -321,6 +440,13 @@ impl State {
             finished_hidden: false,
             finished_toggle: ButtonState::default(),
             notice: None,
+            filters: Vec::new(),
+            filter_mode: FilterMode::Hide,
+            match_case: false,
+            filter_draft: TextState::new(""),
+            peek: false,
+            closed: Vec::new(),
+            buttons: BTreeMap::new(),
             repo: std::env::current_dir().ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default(),
         }
     }
@@ -332,7 +458,7 @@ impl State {
 
 fn sync(state: &mut State) {
     state.rows.resize(state.rows.len().max(state.pulls.as_ref().map_or(0, Vec::len)), ButtonState::default());
-    let Some(Ok(pr)) = state.selected().map(|p| &p.pr) else { return };
+    let Some(pr) = state.selected().and_then(Pull::pr) else { return };
     let active: Vec<i64> = pr
         .threads
         .iter()
@@ -349,9 +475,9 @@ fn sync(state: &mut State) {
     }
     for (path, blob) in files {
         match state.file_views.iter_mut().find(|v| v.slug == slug && v.path == path) {
-            Some(view) if view.viewed.as_ref().is_some_and(|v| *v != blob) => (view.viewed, view.collapsed) = (None, false),
+            Some(view) if view.viewed.as_ref().is_some_and(|v| *v != blob) => view.viewed = None,
             Some(_) => {}
-            None => state.file_views.push(FileView { slug: slug.clone(), path, collapsed: false, viewed: None, toggle: ButtonState::default(), check: ButtonState::default() }),
+            None => state.file_views.push(FileView { slug: slug.clone(), path, collapsed: false, viewed: None, check: ButtonState::default() }),
         }
     }
 }
@@ -413,26 +539,28 @@ fn perform(gate: &Gate, request: &Request) -> gate::Result<()> {
     }
 }
 
-fn load(gate: &Gate, highlighter: &Highlighter, finished: &mut Vec<Pull>) -> Vec<Pull> {
+fn load(gate: &Gate, highlighter: &Highlighter, selected: Option<&str>, finished: &mut Vec<(String, Detail)>) -> Vec<Pull> {
     gate.slugs()
         .unwrap_or_default()
         .into_iter()
         .map(|(slug, lifecycle)| {
-            if let Some(pull) = finished.iter().find(|p| p.slug == slug).filter(|_| !lifecycle.open()) {
-                return pull.clone();
-            }
-            let pr = gate.pr(&slug);
-            let colors = pr.as_ref().map(|pr| highlighter.files(pr)).unwrap_or_default();
             let standing = match lifecycle {
                 Lifecycle::Implementing | Lifecycle::Ready(_) => Standing::Open(gate.status(&slug)),
                 Lifecycle::Merged => Standing::Merged,
                 Lifecycle::Closed => Standing::Closed,
             };
-            let pull = Pull { standing, pr, colors, slug };
-            if !lifecycle.open() {
-                finished.push(pull.clone());
-            }
-            pull
+            let detail = (selected == Some(slug.as_str())).then(|| match finished.iter().find(|(s, _)| *s == slug).filter(|_| !lifecycle.open()) {
+                Some((_, detail)) => detail.clone(),
+                None => {
+                    let pr = gate.pr(&slug);
+                    let detail = Detail { colors: pr.as_ref().map(|pr| highlighter.files(pr)).unwrap_or_default(), pr };
+                    if !lifecycle.open() {
+                        finished.push((slug.clone(), detail.clone()));
+                    }
+                    detail
+                }
+            });
+            Pull { slug, standing, detail }
         })
         .collect()
 }
@@ -451,8 +579,9 @@ fn work(gate: Gate, jobs: Sender<Job>, inbox: Receiver<Job>, updates: Sender<Upd
     let mut last = None;
     let mut done = Vec::new();
     let mut finished = Vec::new();
+    let mut selected = None;
     loop {
-        let pulls = load(&gate, &highlighter, &mut finished);
+        let pulls = load(&gate, &highlighter, selected.as_deref(), &mut finished);
         let mut sent = done.drain(..).map(Update::Done).collect::<Vec<_>>();
         if last.as_ref() != Some(&pulls) {
             sent.insert(0, Update::Pulls(pulls.clone()));
@@ -471,8 +600,10 @@ fn work(gate: Gate, jobs: Sender<Job>, inbox: Receiver<Job>, updates: Sender<Upd
             batch.extend(inbox.try_iter());
         }
         for job in batch {
-            if let Job::Run(request) = job {
-                done.push(perform(&gate, &request));
+            match job {
+                Job::Run(request) => done.push(perform(&gate, &request)),
+                Job::Select(slug) => selected = Some(slug),
+                Job::Start(_) | Job::Changed => {}
             }
         }
     }
@@ -631,6 +762,7 @@ fn pr_row<'a>(index: usize, pull: &Pull, state: &'a State, app: &mut PaneState) 
     })
     .on_click(move |state, app| {
         state.selected = Some(slug.clone());
+        state.jobs.send(Job::Select(slug.clone())).ok();
         state.confirming = None;
         state.notice = None;
         state.pending.clear();
@@ -642,7 +774,7 @@ fn pr_row<'a>(index: usize, pull: &Pull, state: &'a State, app: &mut PaneState) 
     .height(if pull.open() { 56. } else { 32. })
 }
 
-fn tab_button<'a>(tab: Tab, title: &'static str, count: usize, binding: (&ButtonState, Binding<State, ButtonState>), current: Tab, app: &mut PaneState) -> View<'a, State> {
+fn tab_button<'a>(tab: Tab, title: &'static str, count: String, binding: (&ButtonState, Binding<State, ButtonState>), current: Tab, app: &mut PaneState) -> View<'a, State> {
     let id = title.len() as u64;
     let width = title.len() as f32 * 8.5 + 56.;
     button(id!(id), binding)
@@ -657,8 +789,8 @@ fn tab_button<'a>(tab: Tab, title: &'static str, count: usize, binding: (&Button
                 text(id!(id), title).font_weight(if current == tab { FontWeight::MEDIUM } else { FontWeight::NORMAL }).fill(if current == tab { TEXT } else { MUTED }).build(app),
                 stack(vec![
                     rect(id!(id)).fill(Color::from_rgb8(26, 29, 36)).corner_rounding(4.).build(app),
-                    text(id!(id), count.to_string()).font_family(MONO).font_size(11).fill(MUTED).build(app),
-                ]).width(count.to_string().len() as f32 * 7. + 12.).height(20.),
+                    text(id!(id), &count).font_family(MONO).font_size(11).fill(MUTED).build(app),
+                ]).width(count.len() as f32 * 7. + 12.).height(20.),
             ])
         })
         .on_click(move |state, app| {
@@ -885,7 +1017,26 @@ fn item_view<'a>(id: u64, item: &Item<'a>, state: &'a State, app: &mut PaneState
             rail(id, None, card, app)
         }
         Item::Thread(thread) => thread_card(id, thread, state, app).pad_leading(24.),
-        Item::File(file, index) => file_header(*index, file, state, app).pad_top(12.),
+        Item::File(file, index) => file_header(*index, file, None, state, app).pad_top(12.),
+        Item::Hidden { count, added, removed } => {
+            let files = if *count == 1 { "1 file".to_string() } else { format!("{count} files") };
+            let label = if state.peek { "Hide filtered in tree" } else { "Show filtered in tree" };
+            stack(vec![
+                rect(id!(id)).fill(TRANSPARENT).stroke(EDGE, Stroke::new(1.)).corner_rounding(12.).build(app),
+                row_spaced(12., vec![
+                    text(id!(id), format!("{files} hidden by path filters (+{added} −{removed}). They don't count toward your review.")).font_size(13).fill(MUTED).align(Alignment::Start).wrap().build(app).expand_x(),
+                    clickable(id!(id), state, move |app| stack(vec![
+                        rect(id!(id)).fill(TRANSPARENT).stroke(EDGE, Stroke::new(1.)).corner_rounding(6.).build(app),
+                        text(id!(id), label).font_size(12).fill(BODY).build(app),
+                    ]), |state, _| state.peek = !state.peek, app)
+                    .width(label.len() as f32 * 7. + 24.)
+                    .height(30.),
+                ])
+                .pad_x(16.),
+            ])
+            .height(58.)
+            .pad_top(16.)
+        }
         Item::Line(path, l, spans) => {
             let selected = match (&state.composing, &l.line) {
                 (Some((file, start, end)), Line::Added { new, .. } | Line::Context { new, .. }) => file == path && (start..=end).contains(&new),
@@ -893,8 +1044,19 @@ fn item_view<'a>(id: u64, item: &Item<'a>, state: &'a State, app: &mut PaneState
             };
             diff_line(id, path, l, spans, selected, state.selected().is_some_and(Pull::open), state.diff_size, app)
         }
-        Item::Pending(comment) => card(id!(id), column_spaced(6., vec![
-            text(id!(id), "you · pending").font_weight(FontWeight::BOLD).fill(PURPLE).build(app).align(Align::Leading),
+        &Item::Pending(index, comment) => card(id!(id), column_spaced(6., vec![
+            row_spaced(8., vec![
+                text(id!(id), "you · pending").font_weight(FontWeight::BOLD).fill(PURPLE).build(app),
+                space(),
+                clickable(id!(id, 1u64), state, move |app| text(id!(id, 1u64), "Edit").font_size(12).fill(MUTED).build(app).pad_x(6.), move |state, _| {
+                    let Comment { file, start, end, body } = state.pending.remove(index);
+                    state.composing = Some((file, start, end));
+                    state.composer_text = TextState::new(&body);
+                }, app),
+                clickable(id!(id, 2u64), state, move |app| text(id!(id, 2u64), "Remove").font_size(12).fill(RED).build(app).pad_x(6.), move |state, _| {
+                    state.pending.remove(index);
+                }, app),
+            ]),
             line(id!(id), &comment.body, TEXT, app),
         ]), app).pad_y(4.).pad_leading(24.),
         Item::Composer => composer(state, app).pad_y(4.).pad_leading(24.),
@@ -938,38 +1100,15 @@ fn item_view<'a>(id: u64, item: &Item<'a>, state: &'a State, app: &mut PaneState
     }
 }
 
-fn file_header<'a>(index: usize, file: &'a FileDiff, state: &'a State, app: &mut PaneState) -> View<'a, State> {
+fn file_header<'a>(index: usize, file: &'a FileDiff, pinned: Option<usize>, state: &'a State, app: &mut PaneState) -> View<'a, State> {
     let view = &state.file_views[index];
     let (collapsed, viewed, blob) = (view.collapsed, view.viewed.is_some(), file.blob.clone());
-    let id = index as u64;
-    let toggle = button(id!(id), (&view.toggle, Binding::new(move |s: &State| &s.file_views[index].toggle, move |s: &mut State| &mut s.file_views[index].toggle)))
-        .surface(|_, _| empty())
-        .label(move |_, app| {
-            row_spaced(
-                10.,
-                vec![
-                    chevron(id, !collapsed, app),
-                    match file.path.rsplit_once('/') {
-                        Some((dir, name)) => rich_text(id!(id), [
-                            span(format!("{dir}/")).color(FAINT).size(13),
-                            span(name).color(TEXT).weight(FontWeight::MEDIUM).size(13),
-                        ]),
-                        None => rich_text(id!(id), [span(file.path.as_str()).color(TEXT).weight(FontWeight::MEDIUM).size(13)]),
-                    }
-                    .font_family(MONO)
-                    .build(app),
-                    text(id!(id), format!("+{}", file.added)).font_family(MONO).font_size(12).fill(GREEN).build(app),
-                    text(id!(id), format!("−{}", file.removed)).font_family(MONO).font_size(12).fill(RED).build(app),
-                    space(),
-                ],
-            )
-        })
-        .on_click(move |state, app| {
-            state.file_views[index].collapsed = !state.file_views[index].collapsed;
-            app.redraw();
-        })
-        .build(app)
-        .expand_x();
+    let id = (index as u64) << 1 | pinned.is_some() as u64;
+    let jump = move |state: &State, app: &mut PaneState| {
+        if let Some(position) = pinned {
+            app.scroll_to(files_scroller(&state.file_views[index].slug), position);
+        }
+    };
     let check = button(id!(id), (&view.check, Binding::new(move |s: &State| &s.file_views[index].check, move |s: &mut State| &mut s.file_views[index].check)))
         .surface(|_, _| empty())
         .label(move |_, app| {
@@ -985,15 +1124,45 @@ fn file_header<'a>(index: usize, file: &'a FileDiff, state: &'a State, app: &mut
             let view = &mut state.file_views[index];
             view.viewed = if view.viewed.is_some() { None } else { Some(blob.clone()) };
             view.collapsed = view.viewed.is_some();
+            jump(state, app);
             app.redraw();
         })
         .build(app)
         .width(90.);
     stack(vec![
         rect(id!(id)).fill(Color::from_rgb8(16, 18, 22)).stroke(Color::from_rgb8(30, 33, 39), Stroke::new(1.)).corner_rounding(10.).build(app),
-        row_spaced(12., vec![toggle, check]).pad_x(14.),
+        clickable(
+            id!(id),
+            state,
+            move |app| {
+                let path = match file.path.rsplit_once('/') {
+                    Some((dir, name)) => rich_text(id!(id), [
+                        span(format!("{dir}/")).color(FAINT).size(13),
+                        span(name).color(TEXT).weight(FontWeight::MEDIUM).size(13),
+                    ]),
+                    None => rich_text(id!(id), [span(file.path.as_str()).color(TEXT).weight(FontWeight::MEDIUM).size(13)]),
+                };
+                row_spaced(
+                    10.,
+                    vec![
+                        chevron(id, !collapsed, app),
+                        path.font_family(MONO).align(Alignment::Start).wrap().build(app).expand_x(),
+                        text(id!(id), format!("+{}", file.added)).font_family(MONO).font_size(12).fill(GREEN).build(app),
+                        text(id!(id), format!("−{}", file.removed)).font_family(MONO).font_size(12).fill(RED).build(app),
+                        space().width(90.),
+                    ],
+                )
+                .pad_x(14.)
+                .pad_y(12.)
+            },
+            move |state, app| {
+                state.file_views[index].collapsed = !state.file_views[index].collapsed;
+                jump(state, app);
+            },
+            app,
+        ),
+        check.pad_x(14.).align(Align::Trailing),
     ])
-    .height(44.)
 }
 
 fn merge_box<'a>(pull: &'a Pull, state: &'a State, app: &mut PaneState) -> View<'a, State> {
@@ -1059,8 +1228,7 @@ fn merge_box<'a>(pull: &'a Pull, state: &'a State, app: &mut PaneState) -> View<
     };
     let slug = pull.slug.clone();
     let subjects: String = pull
-        .pr
-        .as_ref()
+        .pr()
         .map(|pr| {
             pr.timeline
                 .iter()
@@ -1224,7 +1392,7 @@ fn your_review<'a>(pull: &'a Pull, state: &'a State, app: &mut PaneState) -> Vie
     };
     let reviewing = |v: Verdict| activity(&state.running, |r| matches!(r, Request::Review { verdict, .. } if *verdict == v));
     let count = state.pending.len();
-    let approved = pull.pr.as_ref().is_ok_and(|pr| pr.reviewers.iter().any(|(r, v)| r == YOU && *v == Some(Verdict::Approve)));
+    let approved = pull.pr().is_some_and(|pr| pr.reviewers.iter().any(|(r, v)| r == YOU && *v == Some(Verdict::Approve)));
     let buttons = if approved && count == 0 {
         vec![text(id!(), "You approved this commit").fill(GREEN).font_weight(FontWeight::MEDIUM).build(app)]
     } else if count == 0 {
@@ -1235,8 +1403,9 @@ fn your_review<'a>(pull: &'a Pull, state: &'a State, app: &mut PaneState) -> Vie
             action_button(id!(), "Request changes", YELLOW, reviewing(Verdict::Changes), binding!(state.changes_button), submit(Verdict::Changes), app),
         ]
     };
-    let files = pull.pr.as_ref().map_or(0, |pr| pr.files.len());
-    let viewed = state.file_views.iter().filter(|v| v.slug == pull.slug && v.viewed.is_some()).count();
+    let shown: Vec<&str> = pull.pr().map_or(Vec::new(), |pr| pr.files.iter().map(|f| f.path.as_str()).filter(|p| !hidden(state, p)).collect());
+    let files = shown.len();
+    let viewed = state.file_views.iter().filter(|v| v.slug == pull.slug && v.viewed.is_some() && shown.contains(&v.path.as_str())).count();
     let drafts = match count {
         0 => "no draft comments — click a line to comment".to_string(),
         1 => "1 draft comment".to_string(),
@@ -1295,16 +1464,21 @@ fn items<'a>(pull: &'a Pull, pr: &'a Pr, state: &'a State) -> Vec<Item<'a>> {
         }
         Tab::Files => {
             let mut items = Vec::new();
+            let (mut count, mut added, mut removed) = (0, 0, 0);
             for (f, file) in pr.files.iter().enumerate() {
+                if hidden(state, &file.path) {
+                    (count, added, removed) = (count + 1, added + file.added, removed + file.removed);
+                    continue;
+                }
                 let Some(index) = state.file_views.iter().position(|v| v.slug == pull.slug && v.path == file.path) else { continue };
                 items.push(Item::File(file, index));
                 if !state.file_views[index].collapsed {
                     for (n, l) in file.lines.iter().enumerate() {
-                        let spans = pull.colors.get(f).and_then(|lines| lines.get(n)).map_or(&[][..], |s| s.as_slice());
+                        let spans = pull.detail.as_ref().and_then(|d| d.colors.get(f)).and_then(|lines| lines.get(n)).map_or(&[][..], |s| s.as_slice());
                         items.push(Item::Line(&file.path, l, spans));
                         items.extend(l.threads.iter().map(|&i| Item::Thread(&pr.threads[i])));
                         if let Line::Added { new, .. } | Line::Context { new, .. } = l.line {
-                            items.extend(state.pending.iter().filter(|c| c.file == file.path && c.end == new).map(Item::Pending));
+                            items.extend(state.pending.iter().enumerate().filter(|(_, c)| c.file == file.path && c.end == new).map(|(i, c)| Item::Pending(i, c)));
                             if state.composing.as_ref().is_some_and(|(f, _, end)| *f == file.path && *end == new) {
                                 items.push(Item::Composer);
                             }
@@ -1312,15 +1486,19 @@ fn items<'a>(pull: &'a Pull, pr: &'a Pr, state: &'a State) -> Vec<Item<'a>> {
                     }
                 }
             }
+            if count > 0 {
+                items.push(Item::Hidden { count, added, removed });
+            }
             items
         }
     }
 }
 
 fn detail<'a>(state: &'a State, pull: &'a Pull, app: &mut PaneState) -> View<'a, State> {
-    let pr = match &pull.pr {
-        Ok(pr) => pr,
-        Err(e) => return column(vec![text(id!(), e).fill(RED).build(app).align(Align::Leading), space()]),
+    let pr = match &pull.detail {
+        Some(Detail { pr: Ok(pr), .. }) => pr,
+        None => return column(vec![text(id!(), "Loading…").fill(MUTED).build(app).align(Align::Leading), space()]),
+        Some(Detail { pr: Err(e), .. }) => return column(vec![text(id!(), e).fill(RED).build(app).align(Align::Leading), space()]),
     };
     let (label, color) = pull.label();
     let commits = pr.timeline.iter().filter(|e| matches!(e, Event::Commit { .. })).count();
@@ -1336,7 +1514,9 @@ fn detail<'a>(state: &'a State, pull: &'a Pull, app: &mut PaneState) -> View<'a,
     if let Some(at) = updated {
         meta.push(span(format!("   updated {}", ago(at))).color(MUTED));
     }
-    let items = items(pull, pr, state);
+    let items = Rc::new(items(pull, pr, state));
+    let shown = pr.files.iter().filter(|f| !hidden(state, &f.path)).count();
+    let files = if shown == pr.files.len() { shown.to_string() } else { format!("{shown} / {}", pr.files.len()) };
     column_spaced(
         18.,
         vec![
@@ -1361,19 +1541,234 @@ fn detail<'a>(state: &'a State, pull: &'a Pull, app: &mut PaneState) -> View<'a,
             stack(vec![
                 rect(id!()).fill(BORDER).build(app).height(1.).align(Align::Bottom),
                 row_spaced(4., vec![
-                    tab_button(Tab::Conversation, "Conversation", pr.threads.len(), binding!(state.conversation_tab), state.tab, app),
-                    tab_button(Tab::Files, "Files changed", pr.files.len(), binding!(state.files_tab), state.tab, app),
+                    tab_button(Tab::Conversation, "Conversation", pr.threads.len().to_string(), binding!(state.conversation_tab), state.tab, app),
+                    tab_button(Tab::Files, "Files changed", files, binding!(state.files_tab), state.tab, app),
                     space(),
                 ]),
             ])
             .height(40.),
-            scroller(id!(state.tab as u64, const_hash(&pull.slug, 0, 0)), None, move |i, _, app| items.get(i).map(|item| item_view(i as u64, item, state, app)), app).expand(),
+            match state.tab {
+                Tab::Conversation => scroller(id!(const_hash(&pull.slug, 0, 0)), None, move |i, _, app| items.get(i).map(|item| item_view(i as u64, item, state, app)), app),
+                Tab::Files => pinned_scroller(files_scroller(&pull.slug), None, { let items = items.clone(); move |i, _, app| items.get(i).map(|item| item_view(i as u64, item, state, app)) }, move |top, app| {
+                    let position = items.get(..=top)?.iter().rposition(|i| matches!(i, Item::File(..)))?;
+                    let Item::File(file, index) = items[position] else { return None };
+                    Some(stack(vec![rect(id!()).fill(BACKGROUND).build(app), file_header(index, file, Some(position), state, app).pad_top(12.)]))
+                }, app),
+            }
+            .expand(),
             if state.tab == Tab::Files && pull.open() { your_review(pull, state, app) } else { empty() },
         ],
     )
     .pad_x(36.)
     .pad_top(24.)
     .pad_bottom(16.)
+}
+
+const FOLDER_ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z" fill="none" stroke="#5c6370" stroke-width="1.8" stroke-linejoin="round"/></svg>"##;
+
+const RESOLVED_ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m5 12 5 5 9-10" fill="none" stroke="#34d399" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+
+fn file_tree<'a>(state: &'a State, pull: &'a Pull, pr: &'a Pr, app: &mut PaneState) -> View<'a, State> {
+    let mut root = Folder::default();
+    for file in pr.files.iter().filter(|f| state.peek || !hidden(state, &f.path)) {
+        let mut parts: Vec<&str> = file.path.split('/').collect();
+        parts.pop();
+        parts.into_iter().fold(&mut root, |folder, part| folder.folders.entry(part).or_default()).files.push(file);
+    }
+    let mut rows = Vec::new();
+    root.rows("", 0, &state.closed, &mut rows);
+    let viewed = |path: &str| state.file_views.iter().any(|v| v.slug == pull.slug && v.path == path && v.viewed.is_some());
+    let shown: Vec<&FileDiff> = pr.files.iter().filter(|f| !hidden(state, &f.path)).collect();
+    let reviewed = shown.iter().filter(|f| viewed(&f.path)).count();
+    scroller(id!(), None, move |i, _, app| {
+        let cell = match i {
+            0 => {
+                let segment = |label: &'static str, mode: FilterMode, app: &mut PaneState| {
+                    let on = state.filter_mode == mode;
+                    clickable(id!(mode as u64), state, move |app| stack(vec![
+                        rect(id!(mode as u64)).fill(if on { Color::from_rgb8(28, 31, 38) } else { TRANSPARENT }).corner_rounding(4.).build(app),
+                        text(id!(mode as u64), label).font_size(11).fill(if on { TEXT } else { FAINT }).build(app),
+                    ]), move |state, _| state.filter_mode = mode, app)
+                    .width(40.)
+                    .height(20.)
+                };
+                let mut body = vec![
+                    row(vec![
+                        heading(id!(), "Path filters", app),
+                        stack(vec![
+                            rect(id!()).fill(Color::from_rgb8(10, 11, 13)).stroke(BORDER, Stroke::new(1.)).corner_rounding(6.).build(app),
+                            row_spaced(2., vec![segment("Hide", FilterMode::Hide, app), segment("Only", FilterMode::Only, app)]).pad(2.),
+                        ])
+                        .width(86.)
+                        .height(24.),
+                    ]),
+                    stack(vec![
+                        rect(id!()).fill(Color::from_rgb8(10, 11, 13)).stroke(Color::from_rgb8(35, 38, 45), Stroke::new(1.)).corner_rounding(6.).build(app),
+                        row_spaced(6., vec![
+                            text_field(id!(), binding!(state.filter_draft))
+                                .font_family(MONO)
+                                .font_size(12)
+                                .hint_text("Add pattern, e.g. *test*")
+                                .background(|_, _, _| empty())
+                                .align(Alignment::Start)
+                                .enter_end_editing()
+                                .on_edit(|state, app, edit| {
+                                    if matches!(edit, EditInteraction::End) {
+                                        add_filter(state);
+                                        app.redraw();
+                                    }
+                                })
+                                .build(app)
+                                .expand_x(),
+                            clickable(id!(), state, move |app| stack(vec![
+                                rect(id!()).fill(if state.match_case { ACCENT.with_alpha(0.2) } else { TRANSPARENT }).stroke(if state.match_case { ACCENT } else { TRANSPARENT }, Stroke::new(1.)).corner_rounding(4.).build(app),
+                                text(id!(), "Aa").font_family(MONO).font_size(11).fill(if state.match_case { TEXT } else { FAINT }).build(app),
+                            ]), |state, _| state.match_case = !state.match_case, app)
+                            .width(28.)
+                            .height(24.),
+                            clickable(id!(), state, move |app| stack(vec![
+                                rect(id!()).fill(Color::from_rgb8(28, 31, 38)).corner_rounding(4.).build(app),
+                                text(id!(), "+").font_family(MONO).font_size(13).fill(BODY).build(app),
+                            ]), |state, _| add_filter(state), app)
+                            .width(24.)
+                            .height(24.),
+                        ])
+                        .pad_leading(4.)
+                        .pad_trailing(4.),
+                    ])
+                    .height(32.),
+                ];
+                body.extend(state.filters.iter().enumerate().map(|(n, filter)| {
+                    let count = pr.files.iter().filter(|f| matches(&filter.pattern, &f.path, state.match_case)).count();
+                    let k = n as u64;
+                    stack(vec![
+                        rect(id!(k)).fill(if filter.on { Color::from_rgb8(20, 23, 30) } else { TRANSPARENT }).corner_rounding(6.).build(app),
+                        row_spaced(8., vec![
+                            clickable(id!(k), state, move |app| stack(vec![
+                                rect(id!(k)).fill(if filter.on { ACCENT } else { Color::from_rgb8(42, 46, 54) }).corner_rounding(8.).build(app),
+                                circle(id!(k)).fill(if filter.on { Color::from_rgb8(10, 11, 16) } else { FAINT }).finish(app).width(12.).height(12.).pad(2.).align(if filter.on { Align::Trailing } else { Align::Leading }),
+                            ]), move |state, _| state.filters[n].on = !state.filters[n].on, app)
+                            .width(26.)
+                            .height(16.),
+                            text(id!(k), &filter.pattern).font_family(MONO).font_size(12).fill(if filter.on { TEXT } else { FAINT }).build(app),
+                            space(),
+                            text(id!(k), if count == 1 { "1 file".to_string() } else { format!("{count} files") }).font_family(MONO).font_size(11).fill(FAINT).build(app),
+                            clickable(id!(k), state, move |app| text(id!(k), "×").font_size(14).fill(FAINT).build(app), move |state, _| {
+                                state.filters.remove(n);
+                            }, app)
+                            .width(22.)
+                            .height(22.),
+                        ])
+                        .pad_leading(6.)
+                        .pad_trailing(2.),
+                    ])
+                    .height(30.)
+                }));
+                let total = pr.files.len();
+                let summary = match (state.filters.iter().any(|f| f.on), state.filter_mode) {
+                    (false, _) => format!("No filters on — showing all {total} files"),
+                    (true, FilterMode::Hide) => format!("Hiding {} of {total} files", total - shown.len()),
+                    (true, FilterMode::Only) => format!("Showing {} of {total} files", shown.len()),
+                };
+                body.push(rect(id!()).fill(BORDER).build(app).height(1.));
+                body.push(row(vec![text(id!(), summary).font_size(12).fill(BODY).build(app), space()]));
+                stack(vec![
+                    rect(id!()).fill(CARD).stroke(BORDER, Stroke::new(1.)).corner_rounding(10.).build(app),
+                    column_spaced(10., body).pad(12.),
+                ])
+                .pad_bottom(16.)
+            }
+            1 => {
+                let fraction = if shown.is_empty() { 0. } else { reviewed as f32 / shown.len() as f32 };
+                column_spaced(8., vec![
+                    row(vec![
+                        text(id!(), "Reviewed").font_size(12).fill(MUTED).build(app),
+                        space(),
+                        rich_text(id!(), [span(reviewed.to_string()).color(TEXT).size(12), span(format!(" / {}", shown.len())).color(FAINT).size(12)]).font_family(MONO).build(app),
+                    ])
+                    .height(18.),
+                    stack(vec![
+                        rect(id!()).fill(BORDER).corner_rounding(2.).build(app),
+                        draw(move |area, app: &mut PaneState| rect(id!()).fill(ACCENT).corner_rounding(2.).build(app).width(area.width * fraction).align(Align::Leading).draw(area, app)),
+                    ])
+                    .height(4.),
+                ])
+                .pad_x(6.)
+                .pad_bottom(16.)
+            }
+            2 => row(vec![
+                heading(id!(), "Files", app),
+                clickable(id!(), state, move |app| text(id!(), if state.peek { "Hide filtered" } else { "Show filtered" }).font_size(11).fill(MUTED).build(app), |state, _| state.peek = !state.peek, app).width(90.),
+            ])
+            .height(22.)
+            .pad_x(6.)
+            .pad_bottom(6.),
+            i => match rows.get(i - 3)? {
+                TreeRow::Folder { path, label, depth, count, open } => {
+                    let (path, label, depth, count, open, k) = (path.clone(), label.clone(), *depth, *count, *open, i as u64);
+                    clickable(id!(k), state, move |app| row_spaced(6., vec![
+                        chevron(k, open, app),
+                        svg(id!(k), FOLDER_ICON).finish(app).width(13.).height(13.),
+                        text(id!(k), &label).font_family(MONO).font_size(12).fill(MUTED).align(Alignment::Start).wrap().build(app).expand_x(),
+                        text(id!(k), count.to_string()).font_family(MONO).font_size(10).fill(Color::from_rgb8(92, 99, 112)).build(app),
+                    ])
+                    .pad_leading(6. + depth as f32 * 14.)
+                    .pad_trailing(8.)
+                    .pad_y(7.), move |state, _| match state.closed.iter().position(|p| *p == path) {
+                        Some(n) => {
+                            state.closed.remove(n);
+                        }
+                        None => state.closed.push(path.clone()),
+                    }, app)
+                }
+                TreeRow::File { file, depth } => {
+                    let k = i as u64;
+                    let (file, depth): (&FileDiff, usize) = (file, *depth);
+                    let filtered = hidden(state, &file.path);
+                    let seen = viewed(&file.path);
+                    let threads: Vec<&Thread> = pr.threads.iter().filter(|t| t.file == file.path).collect();
+                    let unsettled: Vec<&&Thread> = threads.iter().filter(|t| t.state.unsettled()).collect();
+                    let badge = match unsettled.first() {
+                        Some(t) => Some((Some(unsettled.len().to_string()), thread_color(t.state))),
+                        None if !threads.is_empty() => Some((None, GREEN)),
+                        None => None,
+                    };
+                    let path = file.path.clone();
+                    clickable(id!(k), state, move |app| {
+                        let mark = match (filtered, seen) {
+                            (true, _) => circle(id!(k)).fill(TRANSPARENT).stroke(Color::from_rgb8(74, 80, 91), Stroke::new(1.)).finish(app),
+                            (false, true) => circle(id!(k)).fill(ACCENT).finish(app),
+                            (false, false) => circle(id!(k)).fill(Color::from_rgb8(42, 46, 54)).finish(app),
+                        };
+                        let mut content = vec![
+                            mark.width(6.).height(6.),
+                            text(id!(k), file.path.rsplit('/').next().unwrap_or(&file.path)).font_size(12).fill(if filtered { Color::from_rgb8(92, 99, 112) } else { BODY }).align(Alignment::Start).wrap().build(app).expand_x(),
+                        ];
+                        if let Some((label, color)) = &badge {
+                            content.push(stack(vec![
+                                rect(id!(k)).fill(color.with_alpha(0.14)).corner_rounding(4.).build(app),
+                                match label {
+                                    Some(label) => text(id!(k), label).font_family(MONO).font_size(10).fill(*color).build(app),
+                                    None => svg(id!(k), RESOLVED_ICON).finish(app).width(10.).height(10.),
+                                },
+                            ]).width(18.).height(16.));
+                        }
+                        content.push(text(id!(k), format!("+{} −{}", file.added, file.removed)).font_family(MONO).font_size(10).fill(FAINT).build(app));
+                        row_spaced(8., content).pad_leading(24. + depth as f32 * 14.).pad_trailing(8.).pad_y(7.)
+                    }, move |state, app| {
+                        let Some(pull) = state.selected() else { return };
+                        let Some(pr) = pull.pr() else { return };
+                        if let Some(position) = items(pull, pr, state).iter().position(|i| matches!(i, Item::File(f, _) if f.path == path)) {
+                            app.scroll_to(files_scroller(&pull.slug), position);
+                        }
+                    }, app)
+                }
+            },
+        };
+        Some(cell)
+    }, app)
+    .pad_x(12.)
+    .pad_top(16.)
 }
 
 fn inspector<'a>(pr: &'a Pr, app: &mut PaneState) -> View<'a, State> {
@@ -1471,11 +1866,15 @@ fn view<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
     };
     let open = state.pulls.iter().flatten().filter(|p| p.open()).count();
     let selected = state.selected();
-    let (detail, inspector) = match selected {
-        None => (column(vec![text(id!(), "Select a PR").fill(MUTED).build(app).align(Align::Leading), space()]).pad(36.), empty()),
-        Some(pull) => (detail(state, pull, app), pull.pr.as_ref().map_or(empty(), |pr| inspector(pr, app))),
-    };
     let panel = |id: u64, content: View<'a, State>, app: &mut PaneState| stack(vec![rect(id!(id)).fill(PANEL).stroke(BORDER, Stroke::new(1.)).build(app), content]);
+    let (tree, detail, inspector) = match selected {
+        None => (empty(), column(vec![text(id!(), "Select a PR").fill(MUTED).build(app).align(Align::Leading), space()]).pad(36.), empty()),
+        Some(pull) => match (pull.pr(), state.tab) {
+            (Some(pr), Tab::Files) => (panel(4, file_tree(state, pull, pr, app), app).width(300.), detail(state, pull, app), empty()),
+            (Some(pr), Tab::Conversation) => (empty(), detail(state, pull, app), panel(3, inspector(pr, app), app).width(340.)),
+            (None, _) => (empty(), detail(state, pull, app), empty()),
+        },
+    };
     let topbar = row_spaced(10., vec![
         circle(id!()).fill(ACCENT).finish(app).width(10.).height(10.),
         text(id!(), "gate").font_weight(FontWeight::SEMI_BOLD).fill(TEXT).build(app),
@@ -1510,9 +1909,14 @@ fn view<'a>(state: &'a State, app: &mut PaneState) -> View<'a, State> {
         column(vec![
             panel(1, topbar, app).height(52.),
             row(vec![
-                panel(2, column_spaced(4., vec![heading(id!(), "Needs you", app).pad_x(8.).pad_bottom(6.), list]).pad_x(12.).pad_y(16.), app).width(280.),
+                if selected.is_some() && state.tab == Tab::Files {
+                    empty()
+                } else {
+                    panel(2, column_spaced(4., vec![heading(id!(), "Needs you", app).pad_x(8.).pad_bottom(6.), list]).pad_x(12.).pad_y(16.), app).width(280.)
+                },
+                tree,
                 detail.expand(),
-                if selected.is_some() { panel(3, inspector, app).width(340.) } else { empty() },
+                inspector,
             ])
             .expand(),
         ]),
@@ -1568,7 +1972,7 @@ mod tests {
                 timeline: vec![review(Verdict::Changes, vec![0], 1), review(Verdict::Approve, Vec::new(), 2)],
                 files: Vec::new(),
             };
-            let pull = Pull { slug: "pr".into(), standing: Standing::Open(Err(String::new())), pr: Ok(pr.clone()), colors: Vec::new() };
+            let pull = Pull { slug: "pr".into(), standing: Standing::Open(Err(String::new())), detail: Some(Detail { pr: Ok(pr.clone()), colors: Vec::new() }) };
             let visible = items(&pull, &pr, &state).iter().any(|i| matches!(i, Item::Thread(_)));
             assert!(visible == shown, "a {} thread folded wrong", thread_state.label());
         }
@@ -1601,7 +2005,8 @@ mod tests {
         state.tab = Tab::Files;
         let mut pane = PaneBuilder::new("main", view).on_start(start).on_frame(apply).build();
         pane.redraw(&mut state, 1280, 860, 1.0);
-        assert!(settle(&mut pane, &mut state, |s| s.pulls.as_ref().is_some_and(|p| !p.is_empty())), "the worker never loaded the PRs");
+        state.jobs.send(Job::Select("pr".into())).unwrap();
+        assert!(settle(&mut pane, &mut state, |s| s.selected().is_some_and(|p| p.detail.is_some())), "the worker never loaded the PR");
         for _ in 0..3 {
             pane.redraw(&mut state, 1280, 860, 1.0);
         }
@@ -1620,7 +2025,9 @@ mod tests {
         pane.redraw(&mut state, 1280, 860, 1.0);
         let mut hit = None;
         'scan: for y in (100..860).step_by(5) {
-            for x in (320..800).step_by(12) {
+            for x in (320..1280).step_by(12) {
+                state.tab = Tab::Files;
+                pane.redraw(&mut state, 1280, 860, 1.0);
                 pane.click(&mut state, Point::new(x as f64, y as f64));
                 if state.running.is_some() {
                     assert!(matches!(state.running, Some(Request::Review { verdict: Verdict::Approve, .. })));
@@ -1688,6 +2095,6 @@ mod tests {
         });
         std::fs::remove_dir_all(&tmp).ok();
         assert!(opened.is_some(), "the merged PR row never selected");
-        assert!(state.selected().unwrap().pr.as_ref().is_ok_and(|pr| !pr.files.is_empty()), "the merged PR didn't load");
+        assert!(state.selected().unwrap().pr().is_some_and(|pr| !pr.files.is_empty()), "the merged PR didn't load");
     }
 }
